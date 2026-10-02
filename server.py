@@ -16,7 +16,11 @@ Rails covered (all MOCK / SANDBOX, scripted for demo scenarios):
 State is in memory: it resets when the server restarts. Fine for a demo.
 """
 
+import base64
 import os
+import threading
+import urllib.parse
+import urllib.request
 import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -136,6 +140,65 @@ def _role(r):
     return ROLE_ALIASES.get(k) or ROLE_ALIASES.get(k.replace("_", " ")) or ROLE_ALIASES.get(k.split("_")[0], k)
 
 
+# --------------------------------------------------------------------------------------
+# WhatsApp cards to the renter (Twilio WhatsApp API). Optional: enabled only when the
+# TWILIO_* and RENTER_WHATSAPP environment variables are set. Sending runs in the
+# background and never blocks or breaks a tool call.
+# --------------------------------------------------------------------------------------
+
+def _wa_config():
+    sid = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
+    tok = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
+    frm = os.environ.get("TWILIO_WHATSAPP_FROM", "").strip()       # e.g. +14155238886
+    to = os.environ.get("RENTER_WHATSAPP", "").strip()              # e.g. +919876543210
+    return (sid, tok, frm, to) if all([sid, tok, frm, to]) else None
+
+
+WA_LOG = []
+
+
+def _wa_send_now(body):
+    cfg = _wa_config()
+    if not cfg:
+        return
+    sid, tok, frm, to = cfg
+    w = lambda n: n if n.startswith("whatsapp:") else f"whatsapp:{n}"
+    data = urllib.parse.urlencode({"From": w(frm), "To": w(to), "Body": body[:1500]}).encode()
+    req = urllib.request.Request(f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json", data=data)
+    req.add_header("Authorization", "Basic " + base64.b64encode(f"{sid}:{tok}".encode()).decode())
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            WA_LOG.append({"at": _now().isoformat(timespec="seconds"), "status": r.status})
+    except Exception as e:  # never break the agent
+        WA_LOG.append({"at": _now().isoformat(timespec="seconds"), "error": str(e)[:200]})
+    del WA_LOG[:-20]
+
+
+def notify_renter(body):
+    """Queue a WhatsApp card to the renter. Returns 'queued' or 'disabled'."""
+    if not _wa_config():
+        return "disabled"
+    threading.Thread(target=_wa_send_now, args=(body,), daemon=True).start()
+    return "queued"
+
+
+def _inr(x):
+    try:
+        x = int(round(float(x)))
+    except Exception:
+        return str(x)
+    s_ = str(x)
+    if len(s_) <= 3:
+        return "\u20b9" + s_
+    head, tail = s_[:-3], s_[-3:]
+    parts = []
+    while len(head) > 2:
+        parts.insert(0, head[-2:]); head = head[:-2]
+    if head:
+        parts.insert(0, head)
+    return "\u20b9" + ",".join(parts) + "," + tail
+
+
 def _fresh_state():
     return {"missions": {}, "mandates": {}, "claims": [], "commitments": {}, "calls": {},
             "attempts": {}, "moves": {}, "quotes": {}, "bookings": {}, "payments": {},
@@ -177,8 +240,10 @@ def create_mission(mission_type: str, goal: str, hard_constraints: dict, closure
                           "closure_condition": closure_condition, "principals": principals,
                           "state": "CAPTURE", "replans": 0, "timeline": [], "created_at": _now().isoformat(timespec="seconds")}
     _log(mid, "created", goal)
-    return {"mission_id": mid, "state": "CAPTURE",
-            "mission_card": f"MISSION CREATED\nGoal: {goal}\nHard constraints: {hard_constraints}\nYour action needed: None right now"}
+    card = (f"\U0001F4CB *Settld \u2014 Mission created*\n{goal}\n\n"
+            f"Hard constraints: {', '.join(f'{k}: {v}' for k, v in hard_constraints.items()) or 'none'}\n"
+            f"Closes when: {closure_condition}\n\nYour action needed: none right now. Mission {mid}")
+    return {"mission_id": mid, "state": "CAPTURE", "mission_card": card, "whatsapp": notify_renter(card)}
 
 
 @mcp.tool(annotations=READ)
@@ -267,6 +332,12 @@ def enforce_mandate(mission_id: str, action_type: str, amount: float = 0, counte
                "decision": decision, "rule": rule, "note": note, "at": _now().isoformat(timespec="seconds")}
         S["decisions"][did] = rec
         _log(mission_id, "mandate_decision", f"{action_type} {amount or ''} -> {decision} ({rule})")
+        if decision == "HUMAN_REQUIRED":
+            what = action_type.replace("_", " ")
+            amt = f" of {_inr(amount)}" if amount else ""
+            card = (f"\u26A0\uFE0F *Settld \u2014 Decision needed*\n{what.capitalize()}{amt} needs your approval.\n"
+                    f"Reason: {note or rule}\n\nEverything else continues. Approve or reject in Settld. Mission {mission_id}")
+            rec["whatsapp"] = notify_renter(card)
         return rec
 
     if md.get("revoked"):
@@ -727,7 +798,9 @@ def simulate_payment(mission_id: str, payee: str, amount: float, purpose: str, m
                           "idempotency_key": idempotency_key, "receipt_ref": f"rcpt://{pid}",
                           "at": _now().isoformat(timespec="seconds")}
     _log(mission_id, "payment", f"{purpose} {amount} to {payee} SUCCESS (sandbox)")
-    return S["payments"][pid]
+    card = (f"\U0001F4B3 *Settld \u2014 Payment made*\n{_inr(amount)} to {payee} for {purpose}.\n"
+            f"Released only after the outcome was verified. Receipt {S['payments'][pid]['receipt_ref']} (sandbox)")
+    return {**S["payments"][pid], "whatsapp": notify_renter(card)}
 
 
 # --------------------------------------------------------------------------------------
@@ -753,7 +826,11 @@ def create_closure_receipt(mission_id: str, outcome_summary: str, verified_evide
                "renter_follow_ups": 0, "closed_at": _now().isoformat(timespec="seconds")}
     m["receipt"] = receipt
     _log(mission_id, "receipt", outcome_summary)
-    return receipt
+    paid = "; ".join(f"{_inr(p['amount'])} to {p['to']}" for p in receipt["payments"]) or "none"
+    card = (f"\u2705 *Settld \u2014 Mission closed*\n{outcome_summary}\n\n"
+            f"Calls handled by Settld: {receipt['calls_handled_by_settld']}\nPayments: {paid}\n"
+            f"Evidence: {', '.join(verified_evidence_refs)}\nYour follow-ups: 0")
+    return {**receipt, "whatsapp": notify_renter(card)}
 
 
 @mcp.tool(annotations=WRITE)
