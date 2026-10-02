@@ -117,6 +117,25 @@ PROFESSIONALS = [
 QUOTES = {"PRO-RAVI": 2400, "PRO-QFIX": 5800, "PRO-AMIT": 1800}
 
 
+ROLE_ALIASES = {
+    "society": "society", "society_office": "society", "society office": "society", "rwa": "society",
+    "society_secretary": "society", "secretary": "society", "society_manager": "society",
+    "property_manager": "property_manager", "property manager": "property_manager", "manager": "property_manager",
+    "owner": "owner", "landlord": "landlord", "property_owner": "owner", "house_owner": "owner",
+    "broker": "broker", "agent": "broker", "real_estate_agent": "broker", "dealer": "broker",
+    "vendor": "vendor", "professional": "vendor", "plumber": "vendor", "electrician": "vendor",
+    "logistics": "logistics", "courier": "logistics", "document": "document", "listing": "listing",
+}
+
+
+def _role(r):
+    """Normalise a counterparty/source role ("Society Office" -> "society")."""
+    if not r:
+        return r
+    k = r.strip().lower().replace("-", "_")
+    return ROLE_ALIASES.get(k) or ROLE_ALIASES.get(k.replace("_", " ")) or ROLE_ALIASES.get(k.split("_")[0], k)
+
+
 def _fresh_state():
     return {"missions": {}, "mandates": {}, "claims": [], "commitments": {}, "calls": {},
             "attempts": {}, "moves": {}, "quotes": {}, "bookings": {}, "payments": {},
@@ -237,6 +256,7 @@ def enforce_mandate(mission_id: str, action_type: str, amount: float = 0, counte
     pay_rent, pay_security_deposit, sign_agreement, share_identity_document, accept_deduction, choose_property.
     at_time: optional ISO time (IST) to test quiet hours; defaults to now."""
     md = S["mandates"].get(mission_id) or {**DEFAULT_MANDATE}
+    counterparty_role = _role(counterparty_role)
     when = datetime.fromisoformat(at_time).astimezone(IST) if at_time else _now()
 
     def decide(decision, rule, note=""):
@@ -340,6 +360,7 @@ def add_claim(mission_id: str, subject_id: str, fact: str, value: bool | int | f
     """Record a claim in the evidence ledger and classify it (verified / unknown / failed) using source rank
     (document 1, society 2, owner 3, broker 4, listing 5) and hedge detection ("should be fine", "dekh lenge"
     = unknown). Returns the claim plus the combined status of that fact across all sources (may be contested)."""
+    source_role = _role(source_role)
     status, rank, why = _classify(source_role, statement, value)
     claim = {"claim_id": _id("CLM"), "mission_id": mission_id, "subject_id": subject_id, "fact": fact,
              "value": value, "source_role": source_role, "source_rank": rank, "statement": statement,
@@ -380,6 +401,9 @@ def represent_counterparty(mission_id: str, property_id: str, counterparty_role:
     p = PROPERTIES.get(property_id)
     if not p:
         return {"error": "unknown_property", "valid": list(PROPERTIES)}
+    counterparty_role = _role(counterparty_role)
+    if counterparty_role == "property_manager":
+        counterparty_role = "society"
     key = (mission_id, property_id, counterparty_role)
     S["attempts"][key] = S["attempts"].get(key, 0) + 1
     call_id = _id("CALL")
