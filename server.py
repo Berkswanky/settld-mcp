@@ -617,15 +617,19 @@ def send_renter_message(text: str, buttons: list[str] | None = None) -> dict:
 
 
 @telegram.tool(annotations=WRITE)
-def send_renter_voice(audio_id: str, caption: str = "") -> dict:
-    """Send a voice note produced by Gnani text_to_speech (pass its audio_id) to the renter (Telegram sendVoice)."""
+def send_renter_voice(audio_id: str, caption: str = "", buttons: list[str] | None = None) -> dict:
+    """Send a voice note produced by Gnani text_to_speech (pass its audio_id) to the renter (Telegram sendVoice),
+    with the same message as a text caption and optional buttons (max 3). One call = voice + text + buttons."""
     a = TG["audio"].get(audio_id)
     if not a:
         return {"sent": False, "error": "unknown audio_id; call Gnani text_to_speech first"}
     if not TG["chat_id"]:
         return {"sent": False, "error": "Renter has not messaged the bot yet (send /start)."}
     try:
-        r = _tg_api("sendVoice", {"chat_id": TG["chat_id"], "caption": caption[:1000]},
+        params = {"chat_id": TG["chat_id"], "caption": caption[:1000]}
+        if buttons:
+            params["reply_markup"] = json.dumps({"inline_keyboard": [[{"text": b, "callback_data": b[:60]} for b in buttons[:3]]]})
+        r = _tg_api("sendVoice", params,
                     files={"voice": ("settld.ogg", a, "audio/ogg")}, timeout=30)
         log("telegram", f"sendVoice -> {r['message_id']}")
         return {"sent": True, "message_id": r["message_id"], "at": ts()}
