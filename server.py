@@ -207,9 +207,48 @@ def _wa_send_now(body):
     return result
 
 
+TG_CHAT = {"id": os.environ.get("TELEGRAM_CHAT_ID", "").strip()}
+
+
+def _tg_send_now(body):
+    """Send a card to the renter's Telegram chat. Returns a short status; never raises."""
+    import json as _json
+    tok = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not tok:
+        return "disabled"
+    base = f"https://api.telegram.org/bot{tok}"
+    try:
+        if not TG_CHAT["id"]:
+            # Auto-discover: the renter must have sent any message (e.g. /start) to the bot first.
+            with urllib.request.urlopen(base + "/getUpdates", timeout=8) as r:
+                ups = _json.loads(r.read().decode()).get("result", [])
+            chats = [u.get("message", {}).get("chat", {}).get("id") for u in ups if u.get("message")]
+            if not chats:
+                return "error: no chat found - send /start to the bot from your phone first"
+            TG_CHAT["id"] = str(chats[-1])
+        data = urllib.parse.urlencode({"chat_id": TG_CHAT["id"], "text": body.replace("*", "")[:4000]}).encode()
+        with urllib.request.urlopen(urllib.request.Request(base + "/sendMessage", data=data), timeout=8) as r:
+            ok = _json.loads(r.read().decode()).get("ok")
+        result = "sent" if ok else "error: telegram returned not ok"
+    except urllib.error.HTTPError as e:
+        try:
+            result = f"error {e.code}: {_json.loads(e.read().decode()).get('description')}"
+        except Exception:
+            result = f"error {e.code}: {e.reason}"
+    except Exception as e:
+        result = f"error: {str(e)[:200]}"
+    print(f"[telegram] {result}", flush=True)
+    return result
+
+
 def notify_renter(body):
-    """Send a WhatsApp card to the renter and return Twilio's result (or 'disabled')."""
-    return _wa_send_now(body)
+    """Send the card to every configured renter channel (Telegram and/or WhatsApp)."""
+    out = []
+    if os.environ.get("TELEGRAM_BOT_TOKEN", "").strip():
+        out.append("telegram: " + _tg_send_now(body))
+    if _wa_config():
+        out.append("whatsapp: " + _wa_send_now(body))
+    return " | ".join(out) or "disabled (no TELEGRAM_BOT_TOKEN or TWILIO_* settings)"
 
 
 def _inr(x):
