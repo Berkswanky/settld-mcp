@@ -1,24 +1,32 @@
 """
-Settld MCP server — custom tools for the Settld tenancy agent on AgenticOrg.
+Settld v2 — one Render service, five MCP connectors + faithful REST mocks.
 
-Rails covered (all MOCK / SANDBOX, scripted for demo scenarios):
-  * Voice  (Gnani-style)          represent_counterparty, capture_commitment, chase_until_resolution
-  * Logistics (Delhivery-style)   verify_location, create_physical_move, track_and_prove_delivery,
-                                  recover_logistics_failure
-  * Field service (Urban Co mock) find_professional, get_quote, book_visit, capture_completion,
-                                  check_fix_status, request_rework
-  * Mission / mandate / evidence  create_mission, get_mission, update_mission_state, set_mandate,
-                                  enforce_mandate, add_claim, get_fact_status, add_commitment,
-                                  list_open_commitments, purpose_evidence_gate, create_closure_receipt
-  * Payments (sandbox simulation) simulate_payment
-  * Demo helpers                  list_demo_properties, reset_demo
+  /gnani/mcp      REAL  Gnani (Vachana) speech-to-text and text-to-speech
+  /telegram/mcp   REAL  Telegram Bot API: renter inbox (text, voice notes, button taps) and replies
+  /delhivery/mcp  MOCK  Delhivery B2C API, same endpoint names and fields
+  /pinelabs/mcp   MOCK  Pine Labs Online (Plural) API, same endpoint names and fields + sandbox checkout page
+  /settld/mcp     3 capabilities no rail offers today + agent memory
 
-State is in memory: it resets when the server restarts. Fine for a demo.
+REST mocks (callable with curl, same paths as the real APIs):
+  /delhivery/c/api/pin-codes/json/        /delhivery/api/kinko/v1/invoice/charges/.json
+  /delhivery/waybill/api/fetch/json/      /delhivery/api/cmu/create.json
+  /delhivery/fm/request/new/              /delhivery/api/v1/packages/json/
+  /delhivery/api/p/update                 /delhivery/api/p/edit
+  /pinelabs/api/auth/v1/token             /pinelabs/api/pay/v1/paymentlink
+  /pinelabs/api/pay/v1/paymentlink/{id}   /pinelabs/api/pay/v1/orders/{order_id}
+  /pinelabs/api/pay/v1/refunds/{order_id} /pinelabs/checkout/{payment_link_id}   (renter-facing page)
+
+Environment: GNANI_API_KEY, TELEGRAM_BOT_TOKEN, optional TELEGRAM_CHAT_ID, PUBLIC_BASE_URL,
+GNANI_STT_LANG (hi-IN), GNANI_TTS_MODEL (timbre-v2.5), GNANI_TTS_VOICE (Kaveri), GNANI_TTS_LANG (hi-IN).
 """
 
 import base64
+import contextlib
+import hashlib
+import json
 import os
-import threading
+import random
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -26,889 +34,961 @@ import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import uvicorn
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from starlette.routing import Mount, Route
 
 IST = ZoneInfo("Asia/Kolkata")
 READ = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True)
 WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False)
-
-mcp = FastMCP(
-    "settld-tools",
-    instructions=(
-        "Tools for Settld, a renter-side tenancy agent. All rails are sandbox/mock. "
-        "Rail success is evidence only; a mission closes only on verified real-world outcome. "
-        "Call enforce_mandate before any consequential action and purpose_evidence_gate before any payment."
-    ),
-    host="0.0.0.0",
-    port=int(os.environ.get("PORT", "8000")),
-    stateless_http=True,
-    json_response=True,
-    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
-)
-
-# --------------------------------------------------------------------------------------
-# Demo data
-# --------------------------------------------------------------------------------------
-
-SOURCE_RANK = {"document": 1, "society": 2, "property_manager": 2, "owner": 3, "landlord": 3,
-               "broker": 4, "listing": 5, "hearsay": 6}
-SOCIETY_FACTS = {"bachelors_allowed", "pets_allowed", "non_veg_allowed", "move_in_timings"}
-HEDGES = ["should be fine", "should be ok", "dekh lenge", "mostly", "i think", "probably",
-          "maybe", "shayad", "ho jayega", "not sure"]
-
-# Scripted answers: PROPERTIES[pid]["script"][role][topic] -> (statement, value)
-PROPERTIES = {
-    "P1": {
-        "name": "Skyline Heights, Flat 1204", "address": "Skyline Heights, Andheri West, Mumbai 400053",
-        "bhk": 2, "rent": 48000, "deposit": 96000, "available_from": "2026-10-01",
-        "contacts": {"broker": "Sameer (broker)", "owner": "Mr. Kulkarni (owner)", "society": "Skyline Heights society office"},
-        "script": {
-            "broker":  {"bachelors_allowed": ("Haan, bachelors chalega, owner is fine with it.", True),
-                        "rent_amount": ("Rent is 48,000 per month.", 48000)},
-            "owner":   {"bachelors_allowed": ("Yes, bachelors are allowed. I have rented to working professionals before.", True),
-                        "rent_amount": ("Rent is 48,000, deposit two months.", 48000),
-                        "available_from": ("Flat is free from 1st October.", "2026-10-01")},
-            "society": {"bachelors_allowed": ("Yes, our bylaws allow bachelor tenants with police verification. I will send the rule on WhatsApp.", True)},
-        },
-    },
-    "P2": {
-        "name": "ABC Residency, Flat 302", "address": "ABC Residency, Powai, Mumbai 400076",
-        "bhk": 2, "rent": 46000, "deposit": 92000, "available_from": "2026-10-01",
-        "contacts": {"broker": "Rakesh (broker)", "owner": "Mrs. Shah (owner)", "society": "ABC Residency property manager"},
-        "script": {
-            "broker":  {"bachelors_allowed": ("Bachelors should be fine, don't worry.", True),
-                        "rent_amount": ("46,000 rent, very good deal.", 46000)},
-            "owner":   {"bachelors_allowed": ("No, I prefer a family. Bachelors are not allowed.", False),
-                        "rent_amount": ("46,000.", 46000)},
-            "society": {"bachelors_allowed": ("Society rules do not permit bachelor tenants in this tower.", False)},
-        },
-    },
-    "P3": {
-        "name": "Green Park Villa, Flat 7", "address": "Green Park, Bandra East, Mumbai 400051",
-        "bhk": 2, "rent": 53000, "deposit": 106000, "available_from": "2026-10-05",
-        "contacts": {"broker": "Imran (broker)", "owner": "Mr. D'Souza (owner)", "society": "Green Park office"},
-        "script": {
-            "broker":  {"bachelors_allowed": ("Yes, bachelors allowed.", True),
-                        "rent_amount": ("Owner was saying 50,000.", 50000)},
-            "owner":   {"bachelors_allowed": ("Bachelors are fine, it is an independent building, no society restriction.", True),
-                        "rent_amount": ("I will not go below 53,000.", 53000),
-                        "available_from": ("Available from 5th October.", "2026-10-05")},
-            "society": {"bachelors_allowed": ("This is an independent building, owner decides.", True)},
-        },
-    },
-    "P4": {
-        "name": "Lakeview Towers, 5B", "address": "Lakeview Towers, Vikhroli, Mumbai 400079",
-        "bhk": 2, "rent": 45000, "deposit": 90000, "available_from": "2026-10-01",
-        "contacts": {"broker": "Neha (broker)", "owner": "Mr. Iyer (owner)", "society": "Lakeview society office"},
-        "script": {
-            "broker":  {"bachelors_allowed": ("Dekh lenge, I will ask the owner.", None),
-                        "rent_amount": ("45,000.", 45000)},
-            "owner":   {},          # never answers -> no_answer
-            "society": {},          # never answers -> no_answer
-        },
-    },
-}
-
-PROFESSIONALS = [
-    {"professional_id": "PRO-RAVI", "name": "Ravi Plumbing Services", "category": "plumber", "rating": 4.7,
-     "jobs_done": 812, "earliest_slot": "Today 16:00", "verified": True},
-    {"professional_id": "PRO-QFIX", "name": "QuickFix Home Repairs", "category": "plumber", "rating": 4.4,
-     "jobs_done": 341, "earliest_slot": "Today 14:00", "verified": True},
-    {"professional_id": "PRO-AMIT", "name": "Amit Electricals", "category": "electrician", "rating": 4.8,
-     "jobs_done": 1203, "earliest_slot": "Tomorrow 10:00", "verified": True},
-]
-QUOTES = {"PRO-RAVI": 2400, "PRO-QFIX": 5800, "PRO-AMIT": 1800}
+SEC = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://settld-mcp.onrender.com").rstrip("/")
 
 
-ROLE_ALIASES = {
-    "society": "society", "society_office": "society", "society office": "society", "rwa": "society",
-    "society_secretary": "society", "secretary": "society", "society_manager": "society",
-    "property_manager": "property_manager", "property manager": "property_manager", "manager": "property_manager",
-    "owner": "owner", "landlord": "landlord", "property_owner": "owner", "house_owner": "owner",
-    "broker": "broker", "agent": "broker", "real_estate_agent": "broker", "dealer": "broker",
-    "vendor": "vendor", "professional": "vendor", "plumber": "vendor", "electrician": "vendor",
-    "logistics": "logistics", "courier": "logistics", "document": "document", "listing": "listing",
-}
-
-
-def _role(r):
-    """Normalise a counterparty/source role ("Society Office" -> "society")."""
-    if not r:
-        return r
-    k = r.strip().lower().replace("-", "_")
-    return ROLE_ALIASES.get(k) or ROLE_ALIASES.get(k.replace("_", " ")) or ROLE_ALIASES.get(k.split("_")[0], k)
-
-
-# --------------------------------------------------------------------------------------
-# WhatsApp cards to the renter (Twilio WhatsApp API). Optional: enabled only when the
-# TWILIO_* and RENTER_WHATSAPP environment variables are set. Sending runs in the
-# background and never blocks or breaks a tool call.
-# --------------------------------------------------------------------------------------
-
-def _wa_config():
-    sid = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
-    tok = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
-    frm = os.environ.get("TWILIO_WHATSAPP_FROM", "").strip()       # e.g. +14155238886
-    to = os.environ.get("RENTER_WHATSAPP", "").strip()              # e.g. +919876543210
-    return (sid, tok, frm, to) if all([sid, tok, frm, to]) else None
-
-
-WA_LOG = []
-
-
-def _wa_send_now(body):
-    """Send one WhatsApp message via Twilio. Returns a short status string; never raises."""
-    cfg = _wa_config()
-    if not cfg:
-        return "disabled (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_FROM or RENTER_WHATSAPP missing)"
-    sid, tok, frm, to = cfg
-    w = lambda n: n.replace(" ", "") if n.startswith("whatsapp:") else f"whatsapp:{n.replace(' ', '')}"
-    fields = {"From": w(frm), "To": w(to)}
-    content_sid = os.environ.get("TWILIO_CONTENT_SID", "").strip()
-    if content_sid:
-        # Template mode: WhatsApp template variables cannot contain newlines, so flatten the card.
-        import json as _json
-        lines = [x.strip() for x in body.replace("*", "").split("\n") if x.strip()]
-        title = lines[0] if lines else "Settld update"
-        detail = " | ".join(lines[1:]) or title
-        full = " | ".join(lines)
-        mapping = os.environ.get("TWILIO_CONTENT_VARIABLES", '{"1": "{full}"}')
-        try:
-            tmpl = _json.loads(mapping)
-        except Exception:
-            tmpl = {"1": "{full}"}
-        vars_ = {k: str(v).replace("{full}", full).replace("{title}", title).replace("{detail}", detail)[:1000]
-                 for k, v in tmpl.items()}
-        fields.update({"ContentSid": content_sid, "ContentVariables": _json.dumps(vars_)})
-    else:
-        fields["Body"] = body[:1500]
-    data = urllib.parse.urlencode(fields).encode()
-    req = urllib.request.Request(f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json", data=data)
-    req.add_header("Authorization", "Basic " + base64.b64encode(f"{sid}:{tok}".encode()).decode())
-    try:
-        with urllib.request.urlopen(req, timeout=8) as r:
-            import json as _json
-            msg = _json.loads(r.read().decode() or "{}")
-            result = f"sent (twilio status {msg.get('status', r.status)}, sid {msg.get('sid', '?')})"
-    except urllib.error.HTTPError as e:
-        try:
-            import json as _json
-            err = _json.loads(e.read().decode() or "{}")
-            result = f"error {e.code}: twilio code {err.get('code')} - {err.get('message')}"
-        except Exception:
-            result = f"error {e.code}: {e.reason}"
-    except Exception as e:
-        result = f"error: {str(e)[:200]}"
-    WA_LOG.append({"at": _now().isoformat(timespec="seconds"), "from": w(frm), "to": w(to)[:-4] + "XXXX", "result": result})
-    del WA_LOG[:-20]
-    print(f"[whatsapp] {result}", flush=True)
-    return result
-
-
-TG_CHAT = {"id": os.environ.get("TELEGRAM_CHAT_ID", "").strip()}
-
-
-def _tg_send_now(body):
-    """Send a card to the renter's Telegram chat. Returns a short status; never raises."""
-    import json as _json
-    tok = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-    if not tok:
-        return "disabled"
-    base = f"https://api.telegram.org/bot{tok}"
-    try:
-        if not TG_CHAT["id"]:
-            # Auto-discover: the renter must have sent any message (e.g. /start) to the bot first.
-            with urllib.request.urlopen(base + "/getUpdates", timeout=8) as r:
-                ups = _json.loads(r.read().decode()).get("result", [])
-            chats = [u.get("message", {}).get("chat", {}).get("id") for u in ups if u.get("message")]
-            if not chats:
-                return "error: no chat found - send /start to the bot from your phone first"
-            TG_CHAT["id"] = str(chats[-1])
-        data = urllib.parse.urlencode({"chat_id": TG_CHAT["id"], "text": body.replace("*", "")[:4000]}).encode()
-        with urllib.request.urlopen(urllib.request.Request(base + "/sendMessage", data=data), timeout=8) as r:
-            ok = _json.loads(r.read().decode()).get("ok")
-        result = "sent" if ok else "error: telegram returned not ok"
-    except urllib.error.HTTPError as e:
-        try:
-            result = f"error {e.code}: {_json.loads(e.read().decode()).get('description')}"
-        except Exception:
-            result = f"error {e.code}: {e.reason}"
-    except Exception as e:
-        result = f"error: {str(e)[:200]}"
-    print(f"[telegram] {result}", flush=True)
-    return result
-
-
-def notify_renter(body):
-    """Send the card to every configured renter channel (Telegram and/or WhatsApp)."""
-    out = []
-    if os.environ.get("TELEGRAM_BOT_TOKEN", "").strip():
-        out.append("telegram: " + _tg_send_now(body))
-    if _wa_config():
-        out.append("whatsapp: " + _wa_send_now(body))
-    return " | ".join(out) or "disabled (no TELEGRAM_BOT_TOKEN or TWILIO_* settings)"
-
-
-def _inr(x):
-    try:
-        x = int(round(float(x)))
-    except Exception:
-        return str(x)
-    s_ = str(x)
-    if len(s_) <= 3:
-        return "\u20b9" + s_
-    head, tail = s_[:-3], s_[-3:]
-    parts = []
-    while len(head) > 2:
-        parts.insert(0, head[-2:]); head = head[:-2]
-    if head:
-        parts.insert(0, head)
-    return "\u20b9" + ",".join(parts) + "," + tail
-
-
-def _fresh_state():
-    return {"missions": {}, "mandates": {}, "claims": [], "commitments": {}, "calls": {},
-            "attempts": {}, "moves": {}, "quotes": {}, "bookings": {}, "payments": {},
-            "gates": {}, "decisions": {}}
-
-
-S = _fresh_state()
-SERVER_STARTED_AT = datetime.now(IST).isoformat(timespec="seconds")
-SERVER_INSTANCE = uuid.uuid4().hex[:6].upper()
-
-
-def _now():
+def now():
     return datetime.now(IST)
 
 
-def _id(prefix):
-    return f"{prefix}-{uuid.uuid4().hex[:8].upper()}"
+def ts():
+    return now().isoformat(timespec="seconds")
 
 
-def _log(mission_id, event, detail):
-    m = S["missions"].get(mission_id)
-    if m is not None:
-        m["timeline"].append({"at": _now().isoformat(timespec="seconds"), "event": event, "detail": detail})
+def log(tag, msg):
+    print(f"[{tag}] {msg}", flush=True)
 
 
-# --------------------------------------------------------------------------------------
-# Mission store
-# --------------------------------------------------------------------------------------
-
-@mcp.tool(annotations=WRITE)
-def create_mission(mission_type: str, goal: str, hard_constraints: dict, closure_condition: str,
-                   principals: list[str], soft_preferences: dict | None = None) -> dict:
-    """Create a tenancy mission (CAPTURE state).
-    mission_type: HOUSE_HUNT | MOVE_IN | RENT_AND_PAYMENTS | REPAIR | RENEWAL | EXIT | GENERAL_COORDINATION.
-    hard_constraints example: {"bachelors_allowed": true, "rent_max": 50000, "bhk": 2, "move_in_by": "2026-10-01"}."""
-    mid = _id("MSN")
-    S["missions"][mid] = {"mission_id": mid, "mission_type": mission_type, "goal": goal,
-                          "hard_constraints": hard_constraints, "soft_preferences": soft_preferences or {},
-                          "closure_condition": closure_condition, "principals": principals,
-                          "state": "CAPTURE", "replans": 0, "timeline": [], "created_at": _now().isoformat(timespec="seconds")}
-    _log(mid, "created", goal)
-    card = (f"\U0001F4CB *Settld \u2014 Mission created*\n{goal}\n\n"
-            f"Hard constraints: {', '.join(f'{k}: {v}' for k, v in hard_constraints.items()) or 'none'}\n"
-            f"Closes when: {closure_condition}\n\nYour action needed: none right now. Mission {mid}")
-    return {"mission_id": mid, "state": "CAPTURE", "mission_card": card, "whatsapp": notify_renter(card)}
+def new_mcp(name, instructions):
+    return FastMCP(name, instructions=instructions, stateless_http=True, json_response=True,
+                   streamable_http_path="/mcp", transport_security=SEC)
 
 
-@mcp.tool(annotations=READ)
-def get_mission(mission_id: str) -> dict:
-    """Get a mission with its state, timeline, claims and open commitments."""
-    m = S["missions"].get(mission_id)
-    if not m:
-        return {"error": "mission_not_found", "mission_id": mission_id}
-    return {**m,
-            "claims": [c for c in S["claims"] if c["mission_id"] == mission_id],
-            "open_commitments": [c for c in S["commitments"].values() if c["mission_id"] == mission_id and c["status"] == "open"]}
-
-
-VALID_STATES = ["CAPTURE", "VERIFY", "PLAN", "EXECUTE", "MONITOR", "VERIFY_OUTCOME", "CLOSED",
-                "HUMAN_REQUIRED", "BLOCKED", "CANCELLED"]
-
-
-@mcp.tool(annotations=WRITE)
-def update_mission_state(mission_id: str, new_state: str, reason: str) -> dict:
-    """Move a mission to a new lifecycle state. Replans (any move back to PLAN) are capped at 5; the 6th
-    moves the mission to BLOCKED. CLOSED is only allowed after create_closure_receipt verified the outcome."""
-    m = S["missions"].get(mission_id)
-    if not m:
-        return {"error": "mission_not_found"}
-    if new_state not in VALID_STATES:
-        return {"error": "invalid_state", "valid_states": VALID_STATES}
-    if new_state == "CLOSED" and not m.get("receipt"):
-        return {"error": "closure_not_verified", "message": "Call create_closure_receipt with verified evidence first."}
-    if new_state == "PLAN" and m["state"] in ("VERIFY_OUTCOME", "MONITOR", "EXECUTE"):
-        m["replans"] += 1
-        if m["replans"] > 5:
-            new_state, reason = "BLOCKED", f"Replan limit reached. Last reason: {reason}"
-    old = m["state"]
-    m["state"] = new_state
-    _log(mission_id, "state_change", f"{old} -> {new_state}: {reason}")
-    return {"mission_id": mission_id, "from": old, "to": new_state, "replans": m["replans"], "reason": reason}
-
-
-# --------------------------------------------------------------------------------------
-# Mandate guard
-# --------------------------------------------------------------------------------------
-
-DEFAULT_MANDATE = {
-    "rent_ceiling": 50000, "deposit_ceiling": 100000, "token_amount_limit": 10000,
-    "repair_autonomous_limit": 3000, "monthly_spend_cap": 10000, "single_payment_hard_limit": 25000,
-    "allowed_counterparties": ["broker", "owner", "landlord", "society", "property_manager", "vendor", "logistics"],
-    "standing_rent_mandate": {"payee": None, "amount": None},
-    "quiet_hours": {"start": "20:00", "end": "09:00"},
-    "approval_rule_contractual": "all_principals",
-    "expires_on": (datetime.now(IST) + timedelta(days=90)).date().isoformat(),
-    "revoked": False,
+# ======================================================================================
+# Simulation switches (failure modes). All ON by default; change with the sim_config tool.
+# ======================================================================================
+SIM_DEFAULTS = {
+    "pickup_no_rider_first_slot": True,   # first pickup request for a date -> no rider available
+    "create_timeout_first_try": True,     # first cmu/create for an order times out (but the shipment WAS created)
+    "track_malformed_first_call": True,   # first tracking call per waybill returns a malformed body
+    "delivery_ndr_once": True,            # first delivery attempt fails: consignee unavailable
+    "payment_status_timeout_once": True,  # first payment-link status check times out
 }
-
-ALWAYS_HUMAN = {"sign_agreement", "change_agreement", "pay_security_deposit", "waive_right",
-                "accept_deduction", "choose_property", "share_identity_document"}
-NEVER_DO = {"impersonate_human", "reveal_ceiling", "pay_without_gate", "delete_evidence"}
-CONTACT_ACTIONS = {"call", "message", "schedule_visit", "negotiate"}
+SIM = dict(SIM_DEFAULTS)
 
 
-@mcp.tool(annotations=WRITE)
-def set_mandate(mission_id: str, overrides: dict | None = None) -> dict:
-    """Set the renter's mandate for a mission. Unspecified fields use defaults (rent_ceiling 50000,
-    repair_autonomous_limit 3000, monthly_spend_cap 10000, single payments > 25000 always need approval,
-    quiet hours 20:00-09:00 IST). Use overrides={"revoked": true} to revoke authority instantly."""
-    mandate = {**DEFAULT_MANDATE, **(overrides or {})}
-    S["mandates"][mission_id] = mandate
-    _log(mission_id, "mandate_set", str(overrides or "defaults"))
-    return {"mission_id": mission_id, "mandate": mandate}
+# ======================================================================================
+# DELHIVERY mock (B2C API). Field names follow Delhivery's documented responses.
+# ======================================================================================
+PINCODES = {
+    "400601": ("Thane", "MH", "THN/TWF", "Y"),
+    "400602": ("Thane", "MH", "THN/TWF", "Y"),
+    "400053": ("Mumbai", "MH", "BOM/AND", "Y"),
+    "400058": ("Mumbai", "MH", "BOM/AND", "Y"),
+    "400076": ("Mumbai", "MH", "BOM/PWI", "Y"),
+    "400079": ("Mumbai", "MH", "BOM/VKH", "Y"),
+    "411001": ("Pune", "MH", "PNQ/CMP", "Y"),
+    "560001": ("Bengaluru", "KA", "BLR/MGR", "Y"),
+    "110017": ("New Delhi", "DL", "DEL/MLV", "Y"),
+    "401404": ("Palghar", "MH", "PLG/BOI", "N"),   # serviceable for delivery, NO pickup
+}
+DLV = {"shipments": {}, "orders": {}, "pickups": {}, "pickup_attempts": {}, "ndr": {}, "creates": {}}
 
 
-@mcp.tool(annotations=WRITE)
-def enforce_mandate(mission_id: str, action_type: str, amount: float = 0, counterparty_role: str = "",
-                    purpose: str = "", payee: str = "", at_time: str = "") -> dict:
-    """Mandate Guard. Returns ALLOW, DENY or HUMAN_REQUIRED for a proposed action, with the rule that fired.
-    Must be called before every consequential action. Checks run live (revocation is never cached).
-    action_type examples: call, message, schedule_visit, negotiate, accept_rent, pay_token, pay_repair,
-    pay_rent, pay_security_deposit, sign_agreement, share_identity_document, accept_deduction, choose_property.
-    at_time: optional ISO time (IST) to test quiet hours; defaults to now."""
-    md = S["mandates"].get(mission_id) or {**DEFAULT_MANDATE}
-    counterparty_role = _role(counterparty_role)
-    when = datetime.fromisoformat(at_time).astimezone(IST) if at_time else _now()
-
-    def decide(decision, rule, note=""):
-        did = _id("DEC")
-        rec = {"decision_id": did, "mission_id": mission_id, "action_type": action_type, "amount": amount,
-               "decision": decision, "rule": rule, "note": note, "at": _now().isoformat(timespec="seconds")}
-        S["decisions"][did] = rec
-        _log(mission_id, "mandate_decision", f"{action_type} {amount or ''} -> {decision} ({rule})")
-        if decision == "HUMAN_REQUIRED":
-            what = action_type.replace("_", " ")
-            amt = f" of {_inr(amount)}" if amount else ""
-            card = (f"\u26A0\uFE0F *Settld \u2014 Decision needed*\n{what.capitalize()}{amt} needs your approval.\n"
-                    f"Reason: {note or rule}\n\nEverything else continues. Approve or reject in Settld. Mission {mission_id}")
-            rec["whatsapp"] = notify_renter(card)
-        return rec
-
-    if md.get("revoked"):
-        return decide("DENY", "R1_mandate_revoked", "Renter revoked authority. Stop all actions.")
-    if when.date().isoformat() > md["expires_on"]:
-        return decide("DENY", "R1_mandate_expired", "Ask renter to renew the mandate.")
-    if action_type in NEVER_DO:
-        return decide("DENY", "R2_never_do_list")
-    if action_type in ALWAYS_HUMAN:
-        return decide("HUMAN_REQUIRED", "R3_always_ask", "This action always needs the renter (all principals if contractual).")
-    if counterparty_role and counterparty_role not in md["allowed_counterparties"]:
-        return decide("HUMAN_REQUIRED", "R4_counterparty_not_allowed")
-
-    # Quiet hours apply to contacting people.
-    if action_type in CONTACT_ACTIONS:
-        h = when.hour + when.minute / 60
-        if h >= 20 or h < 9:
-            nxt = (when + timedelta(days=1 if h >= 20 else 0)).replace(hour=9, minute=0, second=0, microsecond=0)
-            return decide("DENY", "R7_quiet_hours", f"Reschedule to {nxt.isoformat(timespec='minutes')}")
-
-    if action_type in ("accept_rent", "negotiate") and amount and amount > md["rent_ceiling"]:
-        return decide("HUMAN_REQUIRED", "R5_rent_above_ceiling", f"{amount} > ceiling {md['rent_ceiling']}")
-
-    if action_type.startswith("pay_"):
-        srm = md.get("standing_rent_mandate") or {}
-        if action_type == "pay_rent" and srm.get("payee") and payee == srm["payee"] and amount <= (srm.get("amount") or 0):
-            return decide("ALLOW", "R5a_standing_rent_mandate", "Covered by renter-approved standing rent mandate.")
-        if amount > md["single_payment_hard_limit"]:
-            return decide("HUMAN_REQUIRED", "R5_single_payment_hard_limit", f"{amount} > {md['single_payment_hard_limit']}")
-        limit = {"pay_token": md["token_amount_limit"], "pay_repair": md["repair_autonomous_limit"]}.get(action_type)
-        if limit is None:
-            return decide("HUMAN_REQUIRED", "R8_no_autonomous_limit_for_purpose")
-        if amount > limit:
-            return decide("HUMAN_REQUIRED", "R5_amount_above_limit", f"{amount} > {limit}")
-        spent = sum(p["amount"] for p in S["payments"].values() if p["mission_id"] == mission_id
-                    and p["status"] == "SUCCESS" and p["autonomous"])
-        if spent + amount > md["monthly_spend_cap"]:
-            return decide("HUMAN_REQUIRED", "R5_monthly_cap", f"spent {spent} + {amount} > {md['monthly_spend_cap']}")
-        return decide("ALLOW", "R9_within_mandate", "Payment still needs purpose_evidence_gate before release.")
-
-    return decide("ALLOW", "R9_within_mandate")
+def dlv_pincode(filter_codes):
+    pin = str(filter_codes).strip()
+    if pin not in PINCODES:
+        return {"delivery_codes": []}
+    district, state, sort_code, pickup = PINCODES[pin]
+    return {"delivery_codes": [{"postal_code": {
+        "district": district, "pin": int(pin), "max_amount": 0.0, "pre_paid": "Y", "cash": "Y",
+        "pickup": pickup, "repl": "Y", "cod": "Y", "country_code": "IN", "sort_code": sort_code,
+        "is_oda": "N", "state_code": state, "max_weight": 0.0}}]}
 
 
-# --------------------------------------------------------------------------------------
-# Claims ledger (Verifier)
-# --------------------------------------------------------------------------------------
+def dlv_charges(md, ss, d_pin, o_pin, cgm, pt="Pre-paid"):
+    """GET /api/kinko/v1/invoice/charges/.json  md=E (Express) or S (Surface), cgm = grams."""
+    if str(d_pin) not in PINCODES or str(o_pin) not in PINCODES:
+        return {"error": "Non-serviceable pincode", "status": "FAILURE"}
+    kg = max(0.5, float(cgm) / 1000)
+    same_city = PINCODES[str(d_pin)][0] == PINCODES[str(o_pin)][0] or {PINCODES[str(d_pin)][0], PINCODES[str(o_pin)][0]} <= {"Mumbai", "Thane"}
+    zone = "A" if same_city else "B"
+    per_kg = (38 if md == "E" else 24) * (1 if zone == "A" else 1.6)
+    freight = round(per_kg * kg, 2)
+    fuel = round(freight * 0.12, 2)
+    gross = round(freight + fuel + 30, 2)
+    gst = round(gross * 0.18, 2)
+    return [{"charge_DL": freight, "charge_FSC": fuel, "charge_DPH": 30.0, "gross_amount": gross,
+             "tax_data": {"IGST": 0.0, "SGST": round(gst / 2, 2), "CGST": round(gst / 2, 2), "swacch_bharat_tax": 0.0},
+             "total_amount": round(gross + gst, 2), "zone": zone, "charged_weight": float(cgm),
+             "status": "SUCCESS", "md": md, "ss": ss, "pt": pt}]
 
-def _classify(source_role, statement, value):
-    rank = SOURCE_RANK.get(source_role, 6)
-    hedged = any(h in statement.lower() for h in HEDGES)
-    if value is None or hedged:
-        return "unknown", rank, "Hedged or no clear answer. Seek a higher-ranked source."
-    if rank >= 4:
-        return "unknown", rank, "Source rank too low for a hard constraint. Confirm with owner or society."
-    if value is False:
-        return "failed", rank, "Clear 'no' from an authoritative source."
-    return "verified", rank, "Clear answer from an authoritative source."
+
+def dlv_fetch_waybill(count=1):
+    wbs = [str(random.randint(10**12, 10**13 - 1)) for _ in range(int(count))]
+    return wbs[0] if int(count) == 1 else ",".join(wbs)
 
 
-def _fact_status(mission_id, subject_id, fact):
-    cs = [c for c in S["claims"] if c["mission_id"] == mission_id and c["subject_id"] == subject_id and c["fact"] == fact]
-    if not cs:
-        return {"fact": fact, "status": "unknown", "reason": "No claims yet.", "claims": []}
-    authoritative = [c for c in cs if c["source_rank"] <= 3 and c["status"] in ("verified", "failed")]
-    best_rank = min((c["source_rank"] for c in authoritative), default=None)
-    top = [c for c in authoritative if c["source_rank"] == best_rank]
-    values = {str(c["value"]) for c in top}
-    lower_disagree = {str(c["value"]) for c in cs if c["value"] is not None} - values
-    if not authoritative:
-        status, reason = "unknown", "Only hedged or low-rank claims. Unknown is not Yes."
-    elif len(values) > 1:
-        status, reason = "contested", "Sources of the same rank disagree. Escalate to a higher authority."
-    elif fact in SOCIETY_FACTS and best_rank == 3:
-        # Society rules need the society (rank 1-2) when a society exists.
-        others = {str(c["value"]) for c in cs if c["value"] is not None and c["source_rank"] != 3}
-        if others - values:
-            status = "contested"
-            reason = "Owner and broker disagree on a society rule. Escalate to the society office for a decision."
-        else:
-            status = "verified_with_risk"
-            reason = "Only the owner confirmed a society rule. Confirm with the society unless the building is independent."
+def dlv_create(data):
+    """POST /api/cmu/create.json  (format=json&data={"shipments":[...],"pickup_location":{"name":...}})."""
+    ships = data.get("shipments") or []
+    if not ships:
+        return 400, {"success": False, "rmk": "shipments missing", "packages": []}
+    s = ships[0]
+    order = str(s.get("order") or "")
+    if not order:
+        return 400, {"success": False, "rmk": "order id missing", "packages": []}
+    pin = str(s.get("pin") or "")
+    if order in DLV["orders"]:
+        return 200, {"success": False, "package_count": 1, "upload_wbn": "UPL" + uuid.uuid4().hex[:15].upper(),
+                     "packages": [{"status": "Fail", "client": "SETTLD", "remarks": ["Duplicate order id"],
+                                   "waybill": "", "refnum": order, "serviceable": True}],
+                     "rmk": "Duplicate order id"}
+    if pin not in PINCODES:
+        return 200, {"success": False, "package_count": 1, "packages": [{"status": "Fail", "remarks": ["Non serviceable pincode"],
+                     "waybill": "", "refnum": order, "serviceable": False}], "rmk": "Non serviceable pincode"}
+    wb = str(s.get("waybill") or dlv_fetch_waybill())
+    DLV["shipments"][wb] = {"waybill": wb, "order": order, "name": s.get("name"), "add": s.get("add"), "pin": pin,
+                            "phone": s.get("phone"), "products_desc": s.get("products_desc"),
+                            "weight": s.get("weight"), "quantity": s.get("quantity"),
+                            "pickup_location": (data.get("pickup_location") or {}).get("name"),
+                            "stage": 0, "track_calls": 0, "ndr_done": False, "reattempt": False,
+                            "cancelled": False, "created_at": ts(), "scans": []}
+    DLV["orders"][order] = wb
+    _scan(wb, "Manifested", "UD", "Shipment manifested, awaiting pickup")
+    resp = {"cash_pickups_count": 0, "package_count": 1, "upload_wbn": "UPL" + uuid.uuid4().hex[:15].upper(),
+            "replacement_count": 0, "pickups_count": 0,
+            "packages": [{"status": "Success", "client": "SETTLD", "sort_code": PINCODES[pin][2], "remarks": [],
+                          "waybill": wb, "cod_amount": 0.0, "payment": s.get("payment_mode", "Pre-paid"),
+                          "serviceable": True, "refnum": order}],
+            "cash_pickups": 0.0, "cod_count": 0, "success": True, "prepaid_count": 1, "pickups": 0, "cod_amount": 0.0}
+    n = DLV["creates"].get(order, 0) + 1
+    DLV["creates"][order] = n
+    if SIM["create_timeout_first_try"] and n == 1:
+        # The shipment is created on Delhivery's side, but the response never reaches the client.
+        return 504, {"error": "Gateway Timeout", "message": "upstream request timeout", "request_id": uuid.uuid4().hex[:12]}
+    return 200, resp
+
+
+def _scan(wb, status, stype, instr, loc=None):
+    s = DLV["shipments"][wb]
+    s["status"] = {"Status": status, "StatusType": stype, "StatusDateTime": ts(),
+                   "StatusLocation": loc or (PINCODES.get(s["pin"], ("Mumbai",))[0] + "_DC"), "Instructions": instr}
+    s["scans"].append({"ScanDetail": {"Scan": status, "ScanType": stype, "ScanDateTime": ts(),
+                                      "ScannedLocation": s["status"]["StatusLocation"], "Instructions": instr}})
+
+
+def dlv_pickup(data):
+    """POST /fm/request/new/  {pickup_location, pickup_time "HH:MM:SS", pickup_date "YYYY-MM-DD", expected_package_count}."""
+    for k in ("pickup_location", "pickup_time", "pickup_date", "expected_package_count"):
+        if not data.get(k):
+            return 400, {"error": {"message": f"{k} is required"}}
+    try:
+        d = datetime.strptime(str(data["pickup_date"]), "%Y-%m-%d").date()
+        t = datetime.strptime(str(data["pickup_time"])[:8], "%H:%M:%S").time()
+    except ValueError:
+        return 400, {"error": {"message": "pickup_date must be YYYY-MM-DD and pickup_time HH:MM:SS"}}
+    if d < now().date():
+        return 400, {"error": {"message": "pickup_date cannot be in the past"}}
+    if not (10 <= t.hour < 18):
+        return 400, {"error": {"message": "Pickup slots available between 10:00:00 and 18:00:00 only"}}
+    key = str(d)
+    DLV["pickup_attempts"][key] = DLV["pickup_attempts"].get(key, 0) + 1
+    if SIM["pickup_no_rider_first_slot"] and DLV["pickup_attempts"][key] == 1:
+        nxt = (datetime.combine(d, t) + timedelta(hours=3))
+        if nxt.hour >= 18:
+            nxt = datetime.combine(d + timedelta(days=1), datetime.min.time()).replace(hour=11)
+        return 200, {"pr_exist": False, "success": False,
+                     "error": {"code": "NO_RIDER_AVAILABLE",
+                               "message": "No pickup executive available for the requested slot",
+                               "next_available_slot": {"pickup_date": str(nxt.date()), "pickup_time": nxt.strftime("%H:%M:%S")}}}
+    pid = random.randint(10**7, 10**8 - 1)
+    DLV["pickups"][pid] = {**data, "pickup_id": pid, "status": "Scheduled"}
+    for wb, s in DLV["shipments"].items():
+        if s.get("pickup_location") == data["pickup_location"] and s["stage"] == 0 and not s["cancelled"]:
+            s["stage"] = 1
+    return 200, {"pickup_location_name": data["pickup_location"], "client_name": "SETTLD",
+                 "pickup_time": data["pickup_time"], "pickup_id": pid, "incoming_center_name": "Mumbai_Andheri_DC",
+                 "expected_package_count": int(data["expected_package_count"]), "pickup_date": str(d)}
+
+
+def dlv_track(waybill=None, ref_ids=None):
+    """GET /api/v1/packages/json/?waybill=...  or ?ref_ids=<order id>. Advances one stage per call."""
+    wb = waybill
+    if not wb and ref_ids:
+        wb = DLV["orders"].get(str(ref_ids))
+    s = DLV["shipments"].get(str(wb)) if wb else None
+    if not s:
+        return 200, {"ShipmentData": [], "Error": "No such waybill or order id"}
+    s["track_calls"] += 1
+    if SIM["track_malformed_first_call"] and s["track_calls"] == 1:
+        return 200, '{"ShipmentData":[{"Shipment":{"AWB":"' + s["waybill"] + '","Status":{"Status":"In Tr'  # truncated
+    if not s["cancelled"]:
+        st = s["stage"]
+        if st == 1:
+            _scan(s["waybill"], "In Transit", "UD", "Picked up from origin"); s["stage"] = 2
+        elif st == 2:
+            _scan(s["waybill"], "Dispatched", "UD", "Out for delivery"); s["stage"] = 3
+        elif st == 3:
+            if SIM["delivery_ndr_once"] and not s["ndr_done"]:
+                _scan(s["waybill"], "Pending", "UD", "Consignee unavailable - NDR raised, awaiting instruction")
+                s["ndr_done"] = True; s["stage"] = 4
+            else:
+                _deliver(s)
+        elif st == 4 and s["reattempt"]:
+            _scan(s["waybill"], "Dispatched", "UD", "Out for delivery - reattempt"); s["stage"] = 5
+        elif st == 5:
+            _deliver(s)
+    return 200, {"ShipmentData": [{"Shipment": {
+        "AWB": s["waybill"], "ReferenceNo": s["order"], "Origin": "Thane", "Destination": PINCODES.get(s["pin"], ("?",))[0],
+        "Consignee": {"Name": s["name"], "PinCode": int(s["pin"])}, "Status": s["status"], "Scans": s["scans"],
+        "PickUpDate": s["scans"][1]["ScanDetail"]["ScanDateTime"] if len(s["scans"]) > 1 else None,
+        "DeliveryDate": s["status"]["StatusDateTime"] if s["status"]["Status"] == "Delivered" else None,
+        "ExpectedDeliveryDate": (now() + timedelta(days=1)).date().isoformat(), "ChargedWeight": s.get("weight")}}]}
+
+
+def _deliver(s):
+    _scan(s["waybill"], "Delivered", "DL", "Delivered to consignee", )
+    s["status"]["POD"] = {"ReceivedBy": s["name"], "Image": f"{BASE_URL}/delhivery/pod/{s['waybill']}.jpg"}
+    s["stage"] = 9
+
+
+def dlv_ndr(data):
+    """POST /api/p/update  {"data":[{"waybill":..., "act":"RE-ATTEMPT"|"DEFER_DLV"|"EDIT_DETAILS", "action_data":{...}}]}"""
+    items = data.get("data") or []
+    if not items:
+        return 400, {"error": "data missing"}
+    for it in items:
+        wb = str(it.get("waybill"))
+        act = it.get("act")
+        s = DLV["shipments"].get(wb)
+        if not s:
+            return 400, {"error": f"waybill {wb} not found"}
+        if act not in ("RE-ATTEMPT", "DEFER_DLV", "EDIT_DETAILS"):
+            return 400, {"error": f"act {act} not allowed for NDR"}
+        if s["stage"] != 4:
+            return 400, {"error": f"waybill {wb} is not in NDR state", "current_status": s["status"]["Status"]}
+        s["reattempt"] = True
+        if act == "EDIT_DETAILS":
+            s.update({k: v for k, v in (it.get("action_data") or {}).items() if k in ("name", "add", "phone")})
+    rid = "UPL" + uuid.uuid4().hex[:18].upper()
+    DLV["ndr"][rid] = items
+    return 200, {"message": "Request submitted successfully!", "request_id": rid}
+
+
+def dlv_cancel(data):
+    """POST /api/p/edit  {"waybill": "...", "cancellation": "true"}"""
+    s = DLV["shipments"].get(str(data.get("waybill")))
+    if not s:
+        return 400, {"status": False, "error": "waybill not found"}
+    if s["stage"] >= 2:
+        return 200, {"status": False, "waybill": s["waybill"], "remark": "Shipment already picked up; cannot be cancelled"}
+    s["cancelled"] = True
+    _scan(s["waybill"], "Cancelled", "CN", "Shipment cancelled by client")
+    return 200, {"status": True, "waybill": s["waybill"], "remark": "Shipment has been cancelled."}
+
+
+delhivery = new_mcp("delhivery-mock", "Delhivery B2C API mock. Each tool calls the Delhivery endpoint named in its "
+                    "description and returns Delhivery's response fields unchanged. Responses can be failures: "
+                    "non-serviceable pincodes, no rider available, gateway timeouts, malformed bodies, NDR.")
+
+
+@delhivery.tool(annotations=READ)
+def pincode_serviceability(filter_codes: str) -> dict:
+    """GET /c/api/pin-codes/json/?filter_codes=<pin>. Empty delivery_codes = not serviceable. pickup='N' = no pickup."""
+    log("delhivery", f"GET /c/api/pin-codes/json/?filter_codes={filter_codes}")
+    return dlv_pincode(filter_codes)
+
+
+@delhivery.tool(annotations=READ)
+def calculate_shipping_cost(md: str, ss: str, d_pin: str, o_pin: str, cgm: int, pt: str = "Pre-paid") -> dict:
+    """GET /api/kinko/v1/invoice/charges/.json. md: E (Express) or S (Surface). ss: Delivered. cgm: chargeable grams."""
+    log("delhivery", f"GET /api/kinko/v1/invoice/charges/.json?md={md}&o_pin={o_pin}&d_pin={d_pin}&cgm={cgm}")
+    r = dlv_charges(md, ss, d_pin, o_pin, cgm, pt)
+    return {"response": r}
+
+
+@delhivery.tool(annotations=WRITE)
+def fetch_waybill(count: int = 1) -> dict:
+    """GET /waybill/api/fetch/json/?count=<n>. Returns pre-allocated waybill number(s)."""
+    log("delhivery", f"GET /waybill/api/fetch/json/?count={count}")
+    return {"waybill": dlv_fetch_waybill(count)}
+
+
+@delhivery.tool(annotations=WRITE)
+def create_shipment(shipments: list[dict], pickup_location: dict) -> dict:
+    """POST /api/cmu/create.json with data={"shipments":[{name, add, pin, phone, order, payment_mode, products_desc,
+    weight, quantity, waybill?}], "pickup_location":{"name":...}}. Can return http_status 504 (timeout): the shipment
+    may still have been created, so check GET /api/v1/packages/json/?ref_ids=<order> before retrying."""
+    log("delhivery", f"POST /api/cmu/create.json order={shipments[0].get('order') if shipments else None}")
+    code, body = dlv_create({"shipments": shipments, "pickup_location": pickup_location})
+    return {"http_status": code, "body": body}
+
+
+@delhivery.tool(annotations=WRITE)
+def create_pickup_request(pickup_location: str, pickup_time: str, pickup_date: str, expected_package_count: int) -> dict:
+    """POST /fm/request/new/. pickup_time HH:MM:SS (10:00:00-18:00:00), pickup_date YYYY-MM-DD.
+    May fail with error.code NO_RIDER_AVAILABLE and a next_available_slot."""
+    log("delhivery", f"POST /fm/request/new/ {pickup_date} {pickup_time}")
+    code, body = dlv_pickup({"pickup_location": pickup_location, "pickup_time": pickup_time,
+                             "pickup_date": pickup_date, "expected_package_count": expected_package_count})
+    return {"http_status": code, "body": body}
+
+
+@delhivery.tool(annotations=READ)
+def track_shipment(waybill: str = "", ref_ids: str = "") -> dict:
+    """GET /api/v1/packages/json/?waybill=<awb> or ?ref_ids=<order id>. The body may be malformed (not valid JSON);
+    if so, report it and retry later. Status.StatusType DL = delivered. Status 'Pending' with an NDR instruction
+    = delivery failed and needs an NDR action."""
+    log("delhivery", f"GET /api/v1/packages/json/?waybill={waybill}&ref_ids={ref_ids}")
+    code, body = dlv_track(waybill or None, ref_ids or None)
+    if isinstance(body, str):
+        return {"http_status": code, "content_type": "application/json", "raw_body": body,
+                "parse_error": "Expecting ',' delimiter: unterminated string (malformed JSON)"}
+    return {"http_status": code, "body": body}
+
+
+@delhivery.tool(annotations=WRITE)
+def ndr_update(waybill: str, act: str, action_data: dict | None = None) -> dict:
+    """POST /api/p/update {"data":[{"waybill","act","action_data"}]}. act: RE-ATTEMPT, DEFER_DLV (action_data
+    {"deferred_date":"YYYY-MM-DD"}) or EDIT_DETAILS (action_data {name, add, phone}). Only valid in NDR state."""
+    log("delhivery", f"POST /api/p/update waybill={waybill} act={act}")
+    item = {"waybill": waybill, "act": act}
+    if action_data:
+        item["action_data"] = action_data
+    code, body = dlv_ndr({"data": [item]})
+    return {"http_status": code, "body": body}
+
+
+@delhivery.tool(annotations=WRITE)
+def cancel_shipment(waybill: str) -> dict:
+    """POST /api/p/edit {"waybill": ..., "cancellation": "true"}. Fails once the shipment is picked up."""
+    log("delhivery", f"POST /api/p/edit waybill={waybill} cancellation=true")
+    code, body = dlv_cancel({"waybill": waybill, "cancellation": "true"})
+    return {"http_status": code, "body": body}
+
+
+# ======================================================================================
+# PINE LABS mock (Plural API). Amounts in paisa, as Plural does.
+# ======================================================================================
+PINE = {"links": {}, "orders": {}, "refunds": {}, "status_calls": {}}
+ACCOUNTS = {"salary": ("HDFC Salary ****8890", 4200000), "savings": ("SBI Savings ****4321", 125000)}  # paisa
+
+
+def pine_token():
+    return {"access_token": "uat_" + uuid.uuid4().hex, "expires_at": (now() + timedelta(hours=1)).isoformat(timespec="seconds"),
+            "token_type": "Bearer"}
+
+
+def pine_create_link(body):
+    amt = (body.get("amount") or {})
+    value = int(amt.get("value") or 0)
+    ref = body.get("merchant_payment_link_reference")
+    if value < 100:
+        return 400, {"code": "INVALID_REQUEST", "message": "amount.value must be at least 100 (paisa)"}
+    if not ref:
+        return 400, {"code": "INVALID_REQUEST", "message": "merchant_payment_link_reference is required"}
+    for l in PINE["links"].values():
+        if l["merchant_payment_link_reference"] == ref:
+            return 409, {"code": "DUPLICATE_REQUEST", "message": "Payment link already exists for this reference",
+                         "payment_link_id": l["payment_link_id"]}
+    lid = "pl-v1-" + now().strftime("%y%m%d%H%M%S") + "-aa-" + uuid.uuid4().hex[:6]
+    oid = "v1-" + now().strftime("%y%m%d%H%M%S") + "-aa-" + uuid.uuid4().hex[:6]
+    link = {"payment_link": f"{BASE_URL}/pinelabs/checkout/{lid}", "payment_link_id": lid, "status": "CREATED",
+            "amount": {"value": value, "currency": amt.get("currency", "INR")},
+            "amount_due": {"value": value, "currency": amt.get("currency", "INR")}, "order_id": oid,
+            "merchant_payment_link_reference": ref, "description": body.get("description", ""),
+            "expire_by": body.get("expire_by") or (now() + timedelta(hours=24)).isoformat(timespec="seconds"),
+            "allowed_payment_methods": body.get("allowed_payment_methods") or ["UPI", "CARD", "NETBANKING"],
+            "customer": body.get("customer") or {}, "created_at": ts()}
+    PINE["links"][lid] = link
+    PINE["orders"][oid] = {"order_id": oid, "merchant_order_reference": ref, "type": "CHARGE", "status": "CREATED",
+                           "order_amount": link["amount"], "payments": [], "created_at": ts(), "updated_at": ts()}
+    return 200, link
+
+
+def pine_get_link(lid):
+    l = PINE["links"].get(lid)
+    if not l:
+        return 404, {"code": "NOT_FOUND", "message": "payment link not found"}
+    n = PINE["status_calls"].get(lid, 0) + 1
+    PINE["status_calls"][lid] = n
+    if SIM["payment_status_timeout_once"] and n == 1:
+        return 504, {"code": "GATEWAY_TIMEOUT", "message": "Request timed out. Retry with the same identifiers."}
+    return 200, l
+
+
+def pine_get_order(oid):
+    o = PINE["orders"].get(oid)
+    return (200, {"data": o}) if o else (404, {"code": "NOT_FOUND", "message": "order not found"})
+
+
+def pine_refund(oid, body):
+    o = PINE["orders"].get(oid)
+    if not o:
+        return 404, {"code": "NOT_FOUND", "message": "order not found"}
+    if o["status"] != "PROCESSED":
+        return 400, {"code": "INVALID_REQUEST", "message": f"order is {o['status']}; only PROCESSED orders can be refunded"}
+    ref = body.get("merchant_order_reference") or ("rf-" + uuid.uuid4().hex[:8])
+    if ref in PINE["refunds"]:
+        return 200, {"data": PINE["refunds"][ref], "note": "existing refund returned (idempotent)"}
+    val = int((body.get("order_amount") or {}).get("value") or o["order_amount"]["value"])
+    rid = "v1-rf-" + uuid.uuid4().hex[:10]
+    r = {"order_id": rid, "parent_order_id": oid, "merchant_order_reference": ref, "type": "REFUND",
+         "status": "PROCESSED", "order_amount": {"value": val, "currency": "INR"}, "created_at": ts()}
+    PINE["refunds"][ref] = r
+    o["status"] = "REFUNDED" if val >= o["order_amount"]["value"] else "PARTIALLY_REFUNDED"
+    return 200, {"data": r}
+
+
+def pine_pay(lid, account):
+    l = PINE["links"].get(lid)
+    if not l:
+        return "Payment link not found."
+    o = PINE["orders"][l["order_id"]]
+    if l["status"] == "PROCESSED":
+        return "Already paid."
+    name, bal = ACCOUNTS.get(account, ACCOUNTS["salary"])
+    pay = {"id": "pay-" + uuid.uuid4().hex[:10], "payment_method": "UPI", "instrument": name,
+           "payment_amount": l["amount"], "created_at": ts()}
+    if bal < l["amount"]["value"]:
+        pay.update({"status": "FAILED", "error_detail": {"code": "INSUFFICIENT_FUNDS",
+                    "message": "Transaction declined by issuer: insufficient balance"}})
+        o["payments"].append(pay); o["status"] = "FAILED"; o["updated_at"] = ts()
+        l["status"] = "CREATED"  # link stays open for another attempt
+        l["last_attempt"] = {"status": "FAILED", "reason": "INSUFFICIENT_FUNDS", "at": ts()}
+        return f"Payment failed: insufficient balance in {name}."
+    pay["status"] = "PROCESSED"
+    o["payments"].append(pay); o["status"] = "PROCESSED"; o["updated_at"] = ts()
+    l["status"] = "PROCESSED"; l["amount_due"] = {"value": 0, "currency": "INR"}
+    l["last_attempt"] = {"status": "PROCESSED", "at": ts()}
+    return f"Paid \u20b9{l['amount']['value'] / 100:,.2f} from {name}."
+
+
+pinelabs = new_mcp("pinelabs-mock", "Pine Labs Online (Plural) API mock. Amounts are in paisa. Each tool calls the "
+                   "Plural endpoint named in its description. Calls can time out (504); retry with the same identifiers.")
+
+
+@pinelabs.tool(annotations=WRITE)
+def generate_token(client_id: str = "settld_uat", client_secret: str = "***", grant_type: str = "client_credentials") -> dict:
+    """POST /api/auth/v1/token. Returns a Bearer access token (UAT)."""
+    log("pinelabs", "POST /api/auth/v1/token")
+    return pine_token()
+
+
+@pinelabs.tool(annotations=WRITE)
+def create_payment_link(amount_value: int, merchant_payment_link_reference: str, description: str = "",
+                        customer_name: str = "", customer_mobile: str = "", expire_by: str = "") -> dict:
+    """POST /api/pay/v1/paymentlink {"amount":{"value":<paisa>,"currency":"INR"}, "merchant_payment_link_reference",
+    "description", "customer", "expire_by"}. Returns payment_link (URL to send to the customer), payment_link_id,
+    order_id, status CREATED. Reusing a reference returns 409 DUPLICATE_REQUEST with the existing id."""
+    log("pinelabs", f"POST /api/pay/v1/paymentlink ref={merchant_payment_link_reference} value={amount_value}")
+    code, body = pine_create_link({"amount": {"value": amount_value, "currency": "INR"},
+                                   "merchant_payment_link_reference": merchant_payment_link_reference,
+                                   "description": description, "expire_by": expire_by or None,
+                                   "customer": {"first_name": customer_name, "mobile_number": customer_mobile}})
+    return {"http_status": code, "body": body}
+
+
+@pinelabs.tool(annotations=READ)
+def get_payment_link(payment_link_id: str) -> dict:
+    """GET /api/pay/v1/paymentlink/{payment_link_id}. status CREATED (unpaid; see last_attempt for a failed try) or
+    PROCESSED (paid). Can return 504 GATEWAY_TIMEOUT: retry later with the same id."""
+    log("pinelabs", f"GET /api/pay/v1/paymentlink/{payment_link_id}")
+    code, body = pine_get_link(payment_link_id)
+    return {"http_status": code, "body": body}
+
+
+@pinelabs.tool(annotations=READ)
+def get_order(order_id: str) -> dict:
+    """GET /api/pay/v1/orders/{order_id}. data.status: CREATED, PROCESSED, FAILED, REFUNDED; data.payments[] has
+    error_detail.code (e.g. INSUFFICIENT_FUNDS) for failed attempts."""
+    log("pinelabs", f"GET /api/pay/v1/orders/{order_id}")
+    code, body = pine_get_order(order_id)
+    return {"http_status": code, "body": body}
+
+
+@pinelabs.tool(annotations=WRITE)
+def create_refund(order_id: str, merchant_order_reference: str, amount_value: int = 0) -> dict:
+    """POST /api/pay/v1/refunds/{order_id} {"merchant_order_reference", "order_amount":{"value","currency"}}.
+    Same reference twice returns the existing refund (no double refund)."""
+    log("pinelabs", f"POST /api/pay/v1/refunds/{order_id}")
+    body = {"merchant_order_reference": merchant_order_reference}
+    if amount_value:
+        body["order_amount"] = {"value": amount_value, "currency": "INR"}
+    code, b = pine_refund(order_id, body)
+    return {"http_status": code, "body": b}
+
+
+# ======================================================================================
+# TELEGRAM (real) — renter inbox and replies
+# ======================================================================================
+TG = {"offset": 0, "chat_id": os.environ.get("TELEGRAM_CHAT_ID", "").strip(), "audio": {}}
+
+
+def _tg_api(method, params=None, files=None, timeout=15):
+    tok = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not tok:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
+    url = f"https://api.telegram.org/bot{tok}/{method}"
+    if files:
+        boundary = "----settld" + uuid.uuid4().hex
+        parts = []
+        for k, v in (params or {}).items():
+            parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode())
+        for k, (fname, data, ctype) in files.items():
+            parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"; filename=\"{fname}\"\r\n"
+                         f"Content-Type: {ctype}\r\n\r\n".encode() + data + b"\r\n")
+        parts.append(f"--{boundary}--\r\n".encode())
+        req = urllib.request.Request(url, data=b"".join(parts))
+        req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
     else:
-        status = top[0]["status"]
-        reason = f"Decided by {top[0]['source_role']} (rank {best_rank})."
-        if lower_disagree:
-            reason += f" Lower-ranked sources said otherwise ({', '.join(lower_disagree)}); kept on record."
-    return {"fact": fact, "subject_id": subject_id, "status": status, "reason": reason, "claims": cs}
+        req = urllib.request.Request(url, data=urllib.parse.urlencode(params or {}).encode())
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        out = json.loads(r.read().decode())
+    if not out.get("ok"):
+        raise RuntimeError(out.get("description", "telegram error"))
+    return out["result"]
 
 
-@mcp.tool(annotations=WRITE)
-def add_claim(mission_id: str, subject_id: str, fact: str, value: bool | int | float | str | None,
-              source_role: str, statement: str, channel: str = "call", evidence_ref: str = "") -> dict:
-    """Record a claim in the evidence ledger and classify it (verified / unknown / failed) using source rank
-    (document 1, society 2, owner 3, broker 4, listing 5) and hedge detection ("should be fine", "dekh lenge"
-    = unknown). Returns the claim plus the combined status of that fact across all sources (may be contested)."""
-    source_role = _role(source_role)
-    status, rank, why = _classify(source_role, statement, value)
-    claim = {"claim_id": _id("CLM"), "mission_id": mission_id, "subject_id": subject_id, "fact": fact,
-             "value": value, "source_role": source_role, "source_rank": rank, "statement": statement,
-             "channel": channel, "evidence_ref": evidence_ref, "status": status, "why": why,
-             "stated_at": _now().isoformat(timespec="seconds")}
-    S["claims"].append(claim)
-    _log(mission_id, "claim", f"{subject_id}.{fact}={value} from {source_role} -> {status}")
-    return {"claim": claim, "fact_status": _fact_status(mission_id, subject_id, fact)}
+def _tg_download(file_id):
+    tok = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    f = _tg_api("getFile", {"file_id": file_id})
+    with urllib.request.urlopen(f"https://api.telegram.org/file/bot{tok}/{f['file_path']}", timeout=20) as r:
+        return r.read(), f["file_path"]
 
 
-@mcp.tool(annotations=READ)
-def get_fact_status(mission_id: str, subject_id: str, fact: str) -> dict:
-    """Combined status of a fact for a property/job: verified, unknown, contested or failed, with all claims
-    (who said what, when) for the 'Why?' explanation."""
-    return _fact_status(mission_id, subject_id, fact)
+telegram = new_mcp("telegram-settld", "Real Telegram Bot API for the renter's chat with Settld: read new messages, "
+                   "voice notes and button taps; send text, buttons and voice notes.")
 
 
-# --------------------------------------------------------------------------------------
-# Voice (Gnani-style)
-# --------------------------------------------------------------------------------------
+@telegram.tool(annotations=WRITE)
+def get_renter_updates() -> dict:
+    """Fetch NEW renter messages since the last call (Telegram getUpdates). Each item has type text | voice | button,
+    the text or button data, a voice file_id (transcribe with Gnani speech_to_text), and sent_at (IST).
+    Also returns now_ist so you can tell how long the renter has been silent."""
+    try:
+        ups = _tg_api("getUpdates", {"offset": TG["offset"], "timeout": 0,
+                                     "allowed_updates": json.dumps(["message", "callback_query"])})
+    except Exception as e:
+        return {"error": str(e)[:200], "now_ist": ts(), "messages": []}
+    msgs = []
+    for u in ups:
+        TG["offset"] = max(TG["offset"], u["update_id"] + 1)
+        if "callback_query" in u:
+            cq = u["callback_query"]
+            TG["chat_id"] = str(cq["message"]["chat"]["id"])
+            with contextlib.suppress(Exception):
+                _tg_api("answerCallbackQuery", {"callback_query_id": cq["id"], "text": "Got it"})
+            msgs.append({"type": "button", "data": cq.get("data"), "from": cq["from"].get("first_name"),
+                         "sent_at": ts()})
+        elif "message" in u:
+            m = u["message"]
+            TG["chat_id"] = str(m["chat"]["id"])
+            when = datetime.fromtimestamp(m["date"], IST).isoformat(timespec="seconds")
+            if "voice" in m or "audio" in m:
+                v = m.get("voice") or m.get("audio")
+                msgs.append({"type": "voice", "file_id": v["file_id"], "duration_s": v.get("duration"),
+                             "from": m["from"].get("first_name"), "sent_at": when})
+            elif "text" in m:
+                msgs.append({"type": "text", "text": m["text"], "from": m["from"].get("first_name"), "sent_at": when})
+    log("telegram", f"getUpdates -> {len(msgs)} new")
+    return {"now_ist": ts(), "chat_connected": bool(TG["chat_id"]), "messages": msgs}
 
-@mcp.tool(annotations=READ)
-def list_demo_properties() -> dict:
-    """List demo property leads (P1-P4) with listed rent and contacts. Listing data is rank 5: leads only."""
-    return {"properties": [{"property_id": k, "name": v["name"], "address": v["address"], "bhk": v["bhk"],
-                            "listed_rent": v["rent"], "listed_deposit": v["deposit"], "contacts": v["contacts"]}
-                           for k, v in PROPERTIES.items()]}
+
+@telegram.tool(annotations=WRITE)
+def send_renter_message(text: str, buttons: list[str] | None = None) -> dict:
+    """Send a text message to the renter (Telegram sendMessage). Optional buttons (max 3), e.g.
+    ["Confirm", "Cheaper option", "Cancel"]; a tap comes back in get_renter_updates as type=button."""
+    if not TG["chat_id"]:
+        return {"sent": False, "error": "Renter has not messaged the bot yet (send /start)."}
+    params = {"chat_id": TG["chat_id"], "text": text[:4000]}
+    if buttons:
+        params["reply_markup"] = json.dumps({"inline_keyboard": [[{"text": b, "callback_data": b[:60]} for b in buttons[:3]]]})
+    try:
+        r = _tg_api("sendMessage", params)
+        log("telegram", f"sendMessage -> {r['message_id']}")
+        return {"sent": True, "message_id": r["message_id"], "at": ts()}
+    except Exception as e:
+        return {"sent": False, "error": str(e)[:200]}
 
 
-@mcp.tool(annotations=WRITE)
-def represent_counterparty(mission_id: str, property_id: str, counterparty_role: str, question_topic: str,
-                           language: str = "hinglish") -> dict:
-    """Place an AI voice call (sandbox) to a counterparty on the renter's behalf and ask one question.
-    The agent always discloses it is an AI calling for the renter.
-    counterparty_role: broker | owner | society. question_topic: bachelors_allowed | rent_amount | available_from.
-    Returns disposition (answered / no_answer), transcript, the stated value, and a call_id for evidence.
-    Call enforce_mandate(action_type='call') first."""
-    p = PROPERTIES.get(property_id)
-    if not p:
-        return {"error": "unknown_property", "valid": list(PROPERTIES)}
-    counterparty_role = _role(counterparty_role)
-    if counterparty_role == "property_manager":
-        counterparty_role = "society"
-    key = (mission_id, property_id, counterparty_role)
-    S["attempts"][key] = S["attempts"].get(key, 0) + 1
-    call_id = _id("CALL")
-    who = p["contacts"].get(counterparty_role, counterparty_role)
-    opening = f"Settld: Namaste, I'm Settld, an AI assistant calling on behalf of the renter about {p['name']}."
-    answer = p["script"].get(counterparty_role, {}).get(question_topic)
-    if answer is None:
-        rec = {"call_id": call_id, "mission_id": mission_id, "property_id": property_id, "counterparty": who,
-               "role": counterparty_role, "attempt": S["attempts"][key], "disposition": "no_answer",
-               "transcript": [opening + " [No answer — call went unanswered]"], "stated_value": None,
-               "statement": "", "ai_disclosed": True, "at": _now().isoformat(timespec="seconds")}
+@telegram.tool(annotations=WRITE)
+def send_renter_voice(audio_id: str, caption: str = "") -> dict:
+    """Send a voice note produced by Gnani text_to_speech (pass its audio_id) to the renter (Telegram sendVoice)."""
+    a = TG["audio"].get(audio_id)
+    if not a:
+        return {"sent": False, "error": "unknown audio_id; call Gnani text_to_speech first"}
+    if not TG["chat_id"]:
+        return {"sent": False, "error": "Renter has not messaged the bot yet (send /start)."}
+    try:
+        r = _tg_api("sendVoice", {"chat_id": TG["chat_id"], "caption": caption[:1000]},
+                    files={"voice": ("settld.ogg", a, "audio/ogg")}, timeout=30)
+        log("telegram", f"sendVoice -> {r['message_id']}")
+        return {"sent": True, "message_id": r["message_id"], "at": ts()}
+    except Exception as e:
+        return {"sent": False, "error": str(e)[:200]}
+
+
+# ======================================================================================
+# GNANI (real) — speech-to-text and text-to-speech
+# ======================================================================================
+gnani = new_mcp("gnani-settld", "Real Gnani (Vachana) speech APIs. speech_to_text transcribes the renter's Telegram "
+                "voice note (Hinglish supported); text_to_speech turns Settld's reply into a voice note.")
+
+
+@gnani.tool(annotations=READ)
+def speech_to_text(telegram_file_id: str, language_code: str = "") -> dict:
+    """Transcribe a renter voice note with Gnani STT REST (max 60 s). Pass the voice file_id from get_renter_updates.
+    language_code defaults to hi-IN (handles Hindi-English mix); use en-IN for English."""
+    key = os.environ.get("GNANI_API_KEY", "").strip()
+    if not key:
+        return {"success": False, "error": "GNANI_API_KEY not set"}
+    lang = language_code or os.environ.get("GNANI_STT_LANG", "hi-IN")
+    try:
+        audio, path = _tg_download(telegram_file_id)
+    except Exception as e:
+        return {"success": False, "error": f"could not download voice note: {str(e)[:150]}"}
+    try:
+        from gnani.stt import GnaniSTTClient
+        t0 = time.time()
+        res = GnaniSTTClient(api_key=key).transcribe_bytes(audio, filename=os.path.basename(path) or "voice.ogg",
+                                                           language_code=lang)
+        log("gnani", f"STT {lang} {len(audio)}B -> {str(res.get('transcript'))[:80]}")
+        return {"success": bool(res.get("success", True)), "transcript": res.get("transcript", ""),
+                "language_code": lang, "request_id": res.get("request_id"),
+                "latency_ms": int((time.time() - t0) * 1000),
+                "audio_sha256": hashlib.sha256(audio).hexdigest()[:16]}
+    except Exception as e:
+        log("gnani", f"STT error {e}")
+        return {"success": False, "error": f"Gnani STT failed: {str(e)[:200]}"}
+
+
+@gnani.tool(annotations=WRITE)
+def text_to_speech(text: str, voice: str = "", language: str = "") -> dict:
+    """Synthesize Settld's reply with Gnani TTS (Timbre) as an OGG/Opus voice note. Returns audio_id for
+    Telegram send_renter_voice. Keep text short (1-3 sentences); write amounts as words or plain numbers."""
+    key = os.environ.get("GNANI_API_KEY", "").strip()
+    if not key:
+        return {"success": False, "error": "GNANI_API_KEY not set"}
+    model = os.environ.get("GNANI_TTS_MODEL", "timbre-v2.5")
+    voice = voice or os.environ.get("GNANI_TTS_VOICE", "Kaveri")
+    lang = language or os.environ.get("GNANI_TTS_LANG", "hi-IN")
+    try:
+        from gnani.tts import AudioConfig, GnaniTTSClient
+        kwargs = {"voice": voice, "model": model,
+                  "audio_config": AudioConfig(container="ogg", encoding="oggopus", sample_rate=48000)}
+        if model == "timbre-v2.5":
+            kwargs["language"] = lang
+        t0 = time.time()
+        audio = GnaniTTSClient(api_key=key).synthesize(text[:600], **kwargs)
+        aid = "aud-" + uuid.uuid4().hex[:10]
+        TG["audio"][aid] = audio
+        for k in list(TG["audio"])[:-20]:
+            TG["audio"].pop(k, None)
+        log("gnani", f"TTS {model}/{voice} {len(text)} chars -> {len(audio)}B")
+        return {"success": True, "audio_id": aid, "bytes": len(audio), "model": model, "voice": voice,
+                "latency_ms": int((time.time() - t0) * 1000)}
+    except Exception as e:
+        log("gnani", f"TTS error {e}")
+        return {"success": False, "error": f"Gnani TTS failed: {str(e)[:200]}"}
+
+
+# ======================================================================================
+# SETTLD — 3 capabilities no rail offers today + agent memory
+# ======================================================================================
+MEM = {"missions": {}, "consents": {}, "releases": {}}
+HEDGES = ["dekh lenge", "dekhte hain", "baad mein", "shayad", "maybe", "not sure", "sochke", "soch ke", "let me think",
+          "later", "kal batata", "kal bataungi", "abhi nahi"]
+YES = ["haan", "han", "ha ", "yes", "ok", "okay", "theek", "thik", "kar do", "karo", "confirm", "chalega", "done", "go ahead"]
+NO = ["nahi", "nahin", "no", "mat", "cancel", "mehenga", "mehnga", "expensive", "zyada", "rehne do", "ruk"]
+
+settld = new_mcp("settld-capabilities", "Settld capabilities that no rail offers today: Pine Labs mandate evaluation, "
+                 "Pine Labs purpose-bound settlement release, Gnani voice consent extraction; plus mission memory.")
+
+
+@settld.tool(annotations=WRITE)
+def pine_mandate_evaluate(mission_id: str, purpose: str, amount_value: int, payee: str = "") -> dict:
+    """[Capability 1 — Pine Labs, proposed POST /api/pay/v1/mandates/evaluate]
+    Check a payment against the renter's mandate before creating it. Returns decision ALLOW (within budget and
+    purpose), HUMAN_REQUIRED (needs the renter's explicit yes) or DENY, with the rule that fired.
+    amount_value in paisa. Mandate comes from mission memory: budget_paisa, allowed_purposes."""
+    m = MEM["missions"].get(mission_id, {})
+    mandate = m.get("mandate") or {}
+    budget = int(mandate.get("budget_paisa") or 0)
+    purposes = mandate.get("allowed_purposes") or ["moving_charges"]
+    if mandate.get("revoked"):
+        d, rule = "DENY", "mandate_revoked"
+    elif purpose not in purposes:
+        d, rule = "DENY", f"purpose '{purpose}' not in mandate {purposes}"
+    elif not budget:
+        d, rule = "HUMAN_REQUIRED", "no budget stated by renter"
+    elif amount_value > budget:
+        d, rule = "HUMAN_REQUIRED", f"amount {amount_value / 100:.0f} exceeds renter budget {budget / 100:.0f}"
+    elif amount_value > 2500000:
+        d, rule = "HUMAN_REQUIRED", "single payment above 25,000 always needs approval"
     else:
-        statement, value = answer
-        rec = {"call_id": call_id, "mission_id": mission_id, "property_id": property_id, "counterparty": who,
-               "role": counterparty_role, "attempt": S["attempts"][key], "disposition": "answered",
-               "transcript": [opening, f"Settld: Could you confirm {question_topic.replace('_', ' ')}?",
-                              f"{who}: {statement}",
-                              "Settld: Thank you. Could you also share this on WhatsApp in writing?"],
-               "stated_value": value, "statement": statement, "ai_disclosed": True,
-               "recording_ref": f"rec://{call_id}", "at": _now().isoformat(timespec="seconds")}
-    S["calls"][call_id] = rec
-    _log(mission_id, "call", f"{who} ({counterparty_role}) {question_topic}: {rec['disposition']}")
+        d, rule = "ALLOW", f"within budget {budget / 100:.0f} for {purpose}"
+    log("settld", f"mandate {mission_id} {purpose} {amount_value} -> {d}")
+    return {"decision": d, "rule": rule, "mandate": mandate, "evaluated_at": ts()}
+
+
+@settld.tool(annotations=WRITE)
+def pine_conditional_release(mission_id: str, order_id: str, waybill: str, renter_confirmed: bool,
+                             renter_confirmation_text: str = "") -> dict:
+    """[Capability 2 — Pine Labs, proposed POST /api/pay/v1/settlements/conditional-release]
+    Release the renter's captured payment to the logistics payee ONLY when the purpose is fulfilled: the Pine
+    order is PROCESSED, the Delhivery waybill shows Delivered (StatusType DL), and the renter confirmed receipt.
+    Otherwise the money stays HELD (or should be refunded). Idempotent per order_id."""
+    if order_id in MEM["releases"]:
+        return {**MEM["releases"][order_id], "note": "already decided (idempotent)"}
+    o = PINE["orders"].get(order_id)
+    s = DLV["shipments"].get(str(waybill))
+    checks = {"payment_processed": bool(o and o["status"] == "PROCESSED"),
+              "delivered": bool(s and s.get("status", {}).get("StatusType") == "DL"),
+              "renter_confirmed": bool(renter_confirmed)}
+    ok = all(checks.values())
+    out = {"order_id": order_id, "waybill": waybill, "decision": "RELEASED" if ok else "HELD", "checks": checks,
+           "renter_confirmation_text": renter_confirmation_text, "decided_at": ts()}
+    if ok:
+        out["settlement_ref"] = "stl-" + uuid.uuid4().hex[:10]
+        MEM["releases"][order_id] = out
+    log("settld", f"release {order_id} -> {out['decision']} {checks}")
+    return out
+
+
+@settld.tool(annotations=WRITE)
+def gnani_consent_extract(mission_id: str, transcript: str, question_asked: str, amount_value: int = 0) -> dict:
+    """[Capability 3 — Gnani, proposed POST /api/v1/conversation/consent]
+    Turn the renter's reply (voice transcript or text) to a specific question into a consent record:
+    consent YES / NO / UNCLEAR, hedges found (e.g. "dekh lenge" = UNCLEAR, never YES), and a record id that ties
+    the consent to the transcript. Use it before acting on any money decision."""
+    import re as _re
+    t = " " + " ".join(_re.findall(r"[a-z\u0900-\u097f]+", transcript.lower())) + " "
+    hedges = [h for h in HEDGES if f" {h} " in t]
+    yes = [w for w in YES if f" {w.strip()} " in t]
+    no = [w for w in NO if f" {w} " in t]
+    if hedges or (yes and no):
+        c = "UNCLEAR"
+    elif no:
+        c = "NO"
+    elif yes:
+        c = "YES"
+    else:
+        c = "UNCLEAR"
+    rid = "cns-" + uuid.uuid4().hex[:10]
+    rec = {"consent_id": rid, "mission_id": mission_id, "consent": c, "question_asked": question_asked,
+           "transcript": transcript, "hedges": hedges, "yes_markers": yes, "no_markers": no,
+           "amount_value": amount_value, "transcript_sha256": hashlib.sha256(transcript.encode()).hexdigest()[:16],
+           "recorded_at": ts()}
+    MEM["consents"][rid] = rec
+    log("settld", f"consent {mission_id} -> {c}")
     return rec
 
 
-@mcp.tool(annotations=WRITE)
-def capture_commitment(call_id: str) -> dict:
-    """Extract commitments (who promised what, by when) from a call transcript. Vague promises
-    ("dekh lenge", "kal tak") are marked unresolved, never as firm promises."""
-    c = S["calls"].get(call_id)
-    if not c:
-        return {"error": "call_not_found"}
-    out = []
-    st = c.get("statement", "").lower()
-    if "send" in st or "whatsapp" in st:
-        due = (_now() + timedelta(hours=4)).isoformat(timespec="minutes")
-        out.append({"who": c["counterparty"], "what": "Share written confirmation on WhatsApp", "by_when": due, "firm": True})
-    if any(h in st for h in ("dekh lenge", "i will ask", "kal tak")):
-        out.append({"who": c["counterparty"], "what": "Get back with an answer", "by_when": None, "firm": False,
-                    "note": "Unresolved — ask for a specific date and time."})
-    if c["disposition"] == "no_answer":
-        out.append({"who": c["counterparty"], "what": "Call not answered", "by_when": None, "firm": False,
-                    "note": "Retry per chase policy."})
-    return {"call_id": call_id, "commitments": out}
+@settld.tool(annotations=READ)
+def mission_get(mission_id: str = "") -> dict:
+    """Read Settld's memory for a mission (state, facts, ids, timers). With no id, returns the active mission.
+    Settld runs on a schedule, so ALWAYS start a run by reading memory."""
+    if not mission_id:
+        act = [m for m in MEM["missions"].values() if m.get("state") not in ("CLOSED", "CANCELLED")]
+        if not act:
+            return {"active": False, "now_ist": ts(), "message": "No active mission. Wait for a renter request."}
+        m = sorted(act, key=lambda x: x["updated_at"])[-1]
+        return {"active": True, "now_ist": ts(), **m}
+    m = MEM["missions"].get(mission_id)
+    return {"active": bool(m), "now_ist": ts(), **(m or {})}
 
 
-@mcp.tool(annotations=WRITE)
-def add_commitment(mission_id: str, who: str, what: str, by_when: str = "", firm: bool = True) -> dict:
-    """Register a commitment for the Chaser to track."""
-    cid = _id("CMT")
-    S["commitments"][cid] = {"commitment_id": cid, "mission_id": mission_id, "who": who, "what": what,
-                             "by_when": by_when or None, "firm": firm, "status": "open", "attempts": 0}
-    _log(mission_id, "commitment", f"{who}: {what} by {by_when or 'unspecified'}")
-    return S["commitments"][cid]
+@settld.tool(annotations=WRITE)
+def mission_save(mission_id: str, state: str, updates: dict, event: str) -> dict:
+    """Create or update mission memory. state: CAPTURE, VERIFY, PLAN, EXECUTE, MONITOR, VERIFY_OUTCOME,
+    HUMAN_REQUIRED, CLOSED, CANCELLED. updates: dict merged into facts (e.g. from_pin, to_pin, move_date, items,
+    weight_g, mandate, quote_paisa, payment_link_id, order_id, waybill, pickup_id, waiting_for, asked_at,
+    reminders_sent). event: one line for the decision log, e.g. "Pickup slot 11:00 refused (no rider); booked 14:00"."""
+    m = MEM["missions"].get(mission_id) or {"mission_id": mission_id, "created_at": ts(), "facts": {}, "log": []}
+    m["facts"].update(updates or {})
+    if "mandate" in (updates or {}):
+        m["mandate"] = updates["mandate"]
+    m["state"] = state
+    m["updated_at"] = ts()
+    m["log"].append({"at": ts(), "state": state, "event": event})
+    MEM["missions"][mission_id] = m
+    log("settld", f"{mission_id} {state}: {event}")
+    return {"saved": True, "mission_id": mission_id, "state": state, "at": m["updated_at"]}
 
 
-@mcp.tool(annotations=READ)
-def list_open_commitments(mission_id: str) -> dict:
-    """List open commitments for a mission."""
-    return {"open": [c for c in S["commitments"].values() if c["mission_id"] == mission_id and c["status"] == "open"]}
+@settld.tool(annotations=WRITE)
+def sim_config(reset_all: bool = False, set_flags: dict | None = None) -> dict:
+    """Test control: reset all mock data and memory (reset_all=true) and/or switch failure modes on/off.
+    Flags: pickup_no_rider_first_slot, create_timeout_first_try, track_malformed_first_call, delivery_ndr_once,
+    payment_status_timeout_once."""
+    if reset_all:
+        for d in (DLV, PINE):
+            for k in d:
+                d[k] = {}
+        MEM.update({"missions": {}, "consents": {}, "releases": {}})
+        SIM.update(SIM_DEFAULTS)
+    for k, v in (set_flags or {}).items():
+        if k in SIM:
+            SIM[k] = bool(v)
+    return {"sim": SIM, "reset": reset_all, "at": ts()}
 
 
-@mcp.tool(annotations=WRITE)
-def chase_until_resolution(commitment_id: str, outcome: str = "pending") -> dict:
-    """Chase policy for an open commitment. outcome: pending | fulfilled | missed.
-    Policy: 3 attempts per channel, 2 hours apart, 09:00-20:00 IST only; channel order call -> whatsapp ->
-    alternate_contact -> escalate_to_renter. Returns the next action and when."""
-    c = S["commitments"].get(commitment_id)
-    if not c:
-        return {"error": "commitment_not_found"}
-    if outcome == "fulfilled":
-        c["status"] = "fulfilled"
-        _log(c["mission_id"], "commitment_fulfilled", c["what"])
-        return {"commitment_id": commitment_id, "status": "fulfilled", "next_action": "verify_outcome"}
-    c["attempts"] += 1
-    channels = ["call", "whatsapp", "alternate_contact"]
-    idx = (c["attempts"] - 1) // 3
-    if idx >= len(channels):
-        c["status"] = "escalated"
-        _log(c["mission_id"], "escalate", f"All channels exhausted for: {c['what']}")
-        return {"commitment_id": commitment_id, "status": "escalated", "next_action": "escalate_to_renter",
-                "message": "All channels exhausted. Raise an Exception Card with what was tried."}
-    nxt = _now() + timedelta(hours=2)
-    if nxt.hour >= 20 or nxt.hour < 9:
-        nxt = (nxt + timedelta(days=1 if nxt.hour >= 20 else 0)).replace(hour=9, minute=0, second=0, microsecond=0)
-    return {"commitment_id": commitment_id, "status": "open", "attempt": c["attempts"],
-            "next_channel": channels[idx], "next_attempt_at": nxt.isoformat(timespec="minutes"),
-            "tip": "Use the Agent Scheduler connector to schedule the follow-up at next_attempt_at."}
+# ======================================================================================
+# REST routes (same paths as the real APIs) + renter checkout page
+# ======================================================================================
+async def _json(request):
+    ctype = request.headers.get("content-type", "")
+    raw = await request.body()
+    if "application/x-www-form-urlencoded" in ctype:
+        form = urllib.parse.parse_qs(raw.decode())
+        if "data" in form:
+            return json.loads(form["data"][0])
+        return {k: v[0] for k, v in form.items()}
+    return json.loads(raw.decode() or "{}")
 
 
-# --------------------------------------------------------------------------------------
-# Logistics (Delhivery-style)
-# --------------------------------------------------------------------------------------
-
-@mcp.tool(annotations=READ)
-def verify_location(address: str) -> dict:
-    """Validate and standardise an address (sandbox). Delivery history is never proof of tenancy eligibility."""
-    if len(address.strip()) < 10 or "unknown" in address.lower():
-        return {"valid": False, "reason": "Address incomplete or not found. Ask for a corrected address."}
-    pin = next((w for w in address.replace(",", " ").split() if w.isdigit() and len(w) == 6), None)
-    return {"valid": True, "standardised": address.strip().title(), "pincode": pin or "unknown",
-            "coordinates": {"lat": 19.1 + (hash(address) % 100) / 1000, "lng": 72.85 + (hash(address) % 50) / 1000},
-            "serviceable": True}
+def _resp(code, body):
+    return PlainTextResponse(body, status_code=code, media_type="application/json") if isinstance(body, str) \
+        else JSONResponse(body, status_code=code)
 
 
-@mcp.tool(annotations=WRITE)
-def create_physical_move(mission_id: str, pickup_address: str, drop_address: str, items: list[str],
-                         date: str, slot: str, idempotency_key: str) -> dict:
-    """Book a pickup/shipment for belongings or parts (sandbox). Idempotent: the same idempotency_key returns
-    the existing booking instead of double-booking."""
-    for m in S["moves"].values():
-        if m["idempotency_key"] == idempotency_key:
-            return {**m, "note": "Existing booking returned (idempotent)."}
-    wb = _id("WB")
-    S["moves"][wb] = {"waybill": wb, "mission_id": mission_id, "pickup": pickup_address, "drop": drop_address,
-                      "items": items, "date": date, "slot": slot, "idempotency_key": idempotency_key,
-                      "status": "PICKUP_SCHEDULED", "track_calls": 0, "rescheduled": False, "scans": []}
-    _log(mission_id, "logistics_booked", f"{wb} {date} {slot}")
-    return S["moves"][wb]
+async def r_pin(request):
+    return JSONResponse(dlv_pincode(request.query_params.get("filter_codes", "")))
 
 
-@mcp.tool(annotations=READ)
-def track_and_prove_delivery(waybill: str) -> dict:
-    """Track a shipment. Demo script: first pickup attempt fails (NDR: customer not available) unless
-    rescheduled; after reschedule it moves to IN_TRANSIT then DELIVERED with POD. 'Delivered' is evidence
-    only — the renter must still confirm items arrived intact before the mission can close."""
-    m = S["moves"].get(waybill)
-    if not m:
-        return {"error": "waybill_not_found"}
-    m["track_calls"] += 1
-    if not m["rescheduled"]:
-        m["status"] = "NDR"
-        m["ndr"] = {"code": "CUSTOMER_NOT_AVAILABLE", "allowed_actions": ["RE-ATTEMPT", "PICKUP_RESCHEDULE"]}
-    else:
-        m["status"] = "IN_TRANSIT" if m["track_calls"] % 2 == 1 else "DELIVERED"
-        if m["status"] == "DELIVERED":
-            m["pod"] = {"signed_by": "Security desk", "photo_ref": f"pod://{waybill}", "at": _now().isoformat(timespec="minutes")}
-    m["scans"].append({"status": m["status"], "at": _now().isoformat(timespec="minutes")})
-    return {**m, "closure_note": "Rail status is evidence only. Ask renter to confirm receipt."}
+async def r_charges(request):
+    q = request.query_params
+    return JSONResponse(dlv_charges(q.get("md", "S"), q.get("ss", "Delivered"), q.get("d_pin"), q.get("o_pin"),
+                                    q.get("cgm", 500), q.get("pt", "Pre-paid")))
 
 
-@mcp.tool(annotations=WRITE)
-def recover_logistics_failure(waybill: str, action: str, new_date: str = "", new_slot: str = "") -> dict:
-    """Recover a failed pickup/delivery. action: RE-ATTEMPT | PICKUP_RESCHEDULE (only supported NDR actions)."""
-    m = S["moves"].get(waybill)
-    if not m:
-        return {"error": "waybill_not_found"}
-    if m["status"] != "NDR":
-        return {"error": "no_failure_to_recover", "status": m["status"]}
-    if action not in ("RE-ATTEMPT", "PICKUP_RESCHEDULE"):
-        return {"error": "unsupported_action", "allowed": ["RE-ATTEMPT", "PICKUP_RESCHEDULE"]}
-    m["rescheduled"] = True
-    m["status"] = "PICKUP_RESCHEDULED"
-    m["track_calls"] = 0
-    if new_date:
-        m["date"] = new_date
-    if new_slot:
-        m["slot"] = new_slot
-    _log(m["mission_id"], "logistics_recovered", f"{waybill} {action}")
-    return m
+async def r_waybill(request):
+    return JSONResponse(dlv_fetch_waybill(request.query_params.get("count", 1)))
 
 
-# --------------------------------------------------------------------------------------
-# Field service (Urban Company mock)
-# --------------------------------------------------------------------------------------
-
-@mcp.tool(annotations=READ)
-def find_professional(category: str, location: str = "Mumbai") -> dict:
-    """Find verified home-service professionals. category: plumber | electrician."""
-    pros = [p for p in PROFESSIONALS if p["category"] == category.lower()]
-    return {"category": category, "location": location, "professionals": pros}
+async def r_create(request):
+    return _resp(*dlv_create(await _json(request)))
 
 
-@mcp.tool(annotations=WRITE)
-def get_quote(mission_id: str, professional_id: str, problem: str) -> dict:
-    """Get an itemised quote (sandbox). Demo: Ravi Plumbing quotes 2,400; QuickFix quotes 5,800."""
-    if professional_id not in QUOTES:
-        return {"error": "unknown_professional"}
-    qid = _id("QTE")
-    total = QUOTES[professional_id]
-    S["quotes"][qid] = {"quote_id": qid, "mission_id": mission_id, "professional_id": professional_id,
-                        "problem": problem, "total": total, "currency": "INR",
-                        "items": [{"item": "Visit and diagnosis", "amount": 300},
-                                  {"item": "Repair labour and parts", "amount": total - 300}],
-                        "valid_hours": 24}
-    _log(mission_id, "quote", f"{professional_id}: {total}")
-    return S["quotes"][qid]
+async def r_pickup(request):
+    return _resp(*dlv_pickup(await _json(request)))
 
 
-@mcp.tool(annotations=WRITE)
-def book_visit(quote_id: str, slot: str, idempotency_key: str) -> dict:
-    """Book a professional against a quote. Call enforce_mandate first. Idempotent on idempotency_key."""
-    for b in S["bookings"].values():
-        if b["idempotency_key"] == idempotency_key:
-            return {**b, "note": "Existing booking returned (idempotent)."}
-    q = S["quotes"].get(quote_id)
-    if not q:
-        return {"error": "quote_not_found"}
-    bid = _id("BKG")
-    S["bookings"][bid] = {"booking_id": bid, "quote_id": quote_id, "mission_id": q["mission_id"],
-                          "professional_id": q["professional_id"], "slot": slot, "amount": q["total"],
-                          "status": "BOOKED", "visits": 0, "reworks": 0, "idempotency_key": idempotency_key,
-                          "server_instance": SERVER_INSTANCE}
-    _log(q["mission_id"], "booked", f"{bid} {slot}")
-    return S["bookings"][bid]
+async def r_track(request):
+    q = request.query_params
+    return _resp(*dlv_track(q.get("waybill"), q.get("ref_ids")))
 
 
-@mcp.tool(annotations=WRITE)
-def capture_completion(booking_id: str) -> dict:
-    """Professional marks the job complete with before/after photos. This is NOT the outcome check —
-    call check_fix_status (renter confirmation / 24h re-check) before any payment."""
-    b = S["bookings"].get(booking_id)
-    if not b:
-        return {"error": "booking_not_found"}
-    b["visits"] += 1
-    b["status"] = "MARKED_COMPLETE_BY_PROFESSIONAL"
-    _log(b["mission_id"], "completion_claimed", booking_id)
-    return {"booking_id": booking_id, "status": b["status"], "professional_notes": "Replaced washer and sealed joint.",
-            "photos": [f"photo://{booking_id}/before", f"photo://{booking_id}/after"], "warranty_days": 30}
+async def r_ndr(request):
+    return _resp(*dlv_ndr(await _json(request)))
 
 
-@mcp.tool(annotations=READ)
-def check_fix_status(booking_id: str) -> dict:
-    """Independent outcome check (renter photo + 24h re-check, simulated). Demo: after the first visit the
-    leak persists; after one rework it is fixed."""
-    b = S["bookings"].get(booking_id)
-    if not b:
-        return {"error": "booking_not_found"}
-    fixed = b["reworks"] >= 1
-    b["status"] = "VERIFIED_FIXED" if fixed else "NOT_FIXED"
-    _log(b["mission_id"], "outcome_check", f"{booking_id}: {b['status']}")
-    return {"booking_id": booking_id, "fixed": fixed, "status": b["status"],
-            "evidence": {"renter_photo": f"photo://{booking_id}/renter-check-{b['visits']}",
-                         "checked_after_hours": 24},
-            "next": "purpose_evidence_gate then pay" if fixed else "request_rework (do not pay)",
-            "server_instance": SERVER_INSTANCE}
+async def r_edit(request):
+    return _resp(*dlv_cancel(await _json(request)))
 
 
-@mcp.tool(annotations=WRITE)
-def request_rework(booking_id: str, failure_evidence: str) -> dict:
-    """Request rework at no extra cost after a failed outcome check. After 2 failed reworks, switch vendor."""
-    b = S["bookings"].get(booking_id)
-    if not b:
-        return {"error": "booking_not_found"}
-    if b["reworks"] >= 2:
-        return {"booking_id": booking_id, "status": "SWITCH_VENDOR", "message": "Two reworks failed. Book another professional and request refund."}
-    b["reworks"] += 1
-    b["status"] = "REWORK_BOOKED"
-    _log(b["mission_id"], "rework", f"{booking_id} #{b['reworks']}: {failure_evidence}")
-    return {"booking_id": booking_id, "status": b["status"], "rework_number": b["reworks"], "extra_cost": 0}
+async def r_token(request):
+    return JSONResponse(pine_token())
 
 
-# --------------------------------------------------------------------------------------
-# Payments (sandbox simulation) + purpose/evidence gate
-# --------------------------------------------------------------------------------------
-
-@mcp.tool(annotations=WRITE)
-def purpose_evidence_gate(mission_id: str, purpose: str, payee: str, amount: float, evidence_ref: str) -> dict:
-    """Release check before any payment: the purpose's real-world condition must be verified.
-    purpose: repair (needs check_fix_status fixed, evidence_ref=booking_id) | token (needs all hard constraints
-    verified for the property, evidence_ref=property_id) | rent (evidence_ref=agreement or mandate ref).
-    Paying merely because the amount is under the cap is never enough."""
-    ok, why = False, ""
-    diag = {}
-    if purpose == "repair":
-        b = S["bookings"].get(evidence_ref.strip())
-        if not b:
-            why = (f"Booking {evidence_ref} not found on this server (known bookings: {list(S['bookings']) or 'none'}). "
-                   "Hold payment.")
-        elif b["status"] != "VERIFIED_FIXED":
-            why = f"Fix not verified: booking status is {b['status']}. Run check_fix_status first. Hold payment."
-        elif float(b["amount"]) != float(amount):
-            why = f"Amount mismatch: quote was {b['amount']}, request is {amount}. Hold payment."
-        else:
-            ok, why = True, "Fix verified and amount matches quote."
-        diag = {"booking_found": bool(b), "booking_status": b["status"] if b else None,
-                "quoted_amount": b["amount"] if b else None}
-    elif purpose == "token":
-        m = S["missions"].get(mission_id, {})
-        facts = [k for k in m.get("hard_constraints", {}) if k == "bachelors_allowed"] or ["bachelors_allowed"]
-        statuses = {f: _fact_status(mission_id, evidence_ref, f)["status"] for f in facts}
-        ok = all(s == "verified" for s in statuses.values())
-        why = f"Hard constraints: {statuses}." + ("" if ok else " Not all verified. Hold payment.")
-    elif purpose == "rent":
-        ok, why = bool(evidence_ref), "Rent backed by agreement/standing mandate." if evidence_ref else "No agreement reference."
-    else:
-        why = "Unknown purpose. Hold payment and ask renter."
-    gid = _id("GATE")
-    S["gates"][gid] = {"gate_id": gid, "mission_id": mission_id, "purpose": purpose, "payee": payee,
-                       "amount": amount, "condition_met": ok, "why": why, "diagnostics": diag,
-                       "server_instance": SERVER_INSTANCE, "server_started_at": SERVER_STARTED_AT}
-    _log(mission_id, "evidence_gate", f"{purpose} {amount} -> {'PASS' if ok else 'HOLD'}")
-    return S["gates"][gid]
+async def r_link_create(request):
+    return _resp(*pine_create_link(await _json(request)))
 
 
-@mcp.tool(annotations=WRITE)
-def simulate_payment(mission_id: str, payee: str, amount: float, purpose: str, mandate_decision_id: str,
-                     gate_id: str, idempotency_key: str, approved_by_human: str = "") -> dict:
-    """SANDBOX payment (Pine Labs stand-in). Requires an ALLOW decision from enforce_mandate (or a human approval
-    name when the decision was HUMAN_REQUIRED) AND a passing purpose_evidence_gate. Idempotent: the same key never
-    pays twice. Returns a verifiable receipt."""
-    for p in S["payments"].values():
-        if p["idempotency_key"] == idempotency_key:
-            return {**p, "note": "Existing payment returned (idempotent, no double pay)."}
-    d = S["decisions"].get(mandate_decision_id)
-    g = S["gates"].get(gate_id)
-    if not d:
-        return {"status": "BLOCKED", "reason": "No mandate decision found."}
-    if d["decision"] == "DENY":
-        return {"status": "BLOCKED", "reason": f"Mandate denied ({d['rule']})."}
-    if d["decision"] == "HUMAN_REQUIRED" and not approved_by_human:
-        return {"status": "BLOCKED", "reason": "Human approval required. Raise an Exception Card."}
-    if not g or not g["condition_met"]:
-        return {"status": "BLOCKED", "reason": "Purpose evidence gate not passed."}
-    pid = _id("PAY")
-    S["payments"][pid] = {"payment_id": pid, "mission_id": mission_id, "payee": payee, "amount": amount,
-                          "purpose": purpose, "status": "SUCCESS", "mode": "SANDBOX",
-                          "autonomous": d["decision"] == "ALLOW", "approved_by": approved_by_human or "mandate",
-                          "idempotency_key": idempotency_key, "receipt_ref": f"rcpt://{pid}",
-                          "at": _now().isoformat(timespec="seconds")}
-    _log(mission_id, "payment", f"{purpose} {amount} to {payee} SUCCESS (sandbox)")
-    card = (f"\U0001F4B3 *Settld \u2014 Payment made*\n{_inr(amount)} to {payee} for {purpose}.\n"
-            f"Released only after the outcome was verified. Receipt {S['payments'][pid]['receipt_ref']} (sandbox)")
-    return {**S["payments"][pid], "whatsapp": notify_renter(card)}
+async def r_link_get(request):
+    return _resp(*pine_get_link(request.path_params["lid"]))
 
 
-# --------------------------------------------------------------------------------------
-# Closure + demo helpers
-# --------------------------------------------------------------------------------------
-
-@mcp.tool(annotations=WRITE)
-def create_closure_receipt(mission_id: str, outcome_summary: str, verified_evidence_refs: list[str],
-                           renter_confirmed: bool) -> dict:
-    """Generate the Closure Receipt. Refuses unless renter_confirmed is true and at least one verified evidence
-    reference is given. After this, call update_mission_state(new_state='CLOSED')."""
-    m = S["missions"].get(mission_id)
-    if not m:
-        return {"error": "mission_not_found"}
-    if not renter_confirmed or not verified_evidence_refs:
-        return {"error": "outcome_not_verified", "message": "Need renter confirmation and verified evidence."}
-    calls = [c for c in S["calls"].values() if c["mission_id"] == mission_id]
-    pays = [p for p in S["payments"].values() if p["mission_id"] == mission_id]
-    receipt = {"receipt_id": _id("RCPT"), "mission_id": mission_id, "mission_type": m["mission_type"],
-               "outcome": outcome_summary, "evidence": verified_evidence_refs,
-               "calls_handled_by_settld": len(calls), "payments": [{"amount": p["amount"], "to": p["payee"],
-               "purpose": p["purpose"], "receipt": p["receipt_ref"]} for p in pays],
-               "renter_follow_ups": 0, "closed_at": _now().isoformat(timespec="seconds")}
-    m["receipt"] = receipt
-    _log(mission_id, "receipt", outcome_summary)
-    paid = "; ".join(f"{_inr(p['amount'])} to {p['to']}" for p in receipt["payments"]) or "none"
-    card = (f"\u2705 *Settld \u2014 Mission closed*\n{outcome_summary}\n\n"
-            f"Calls handled by Settld: {receipt['calls_handled_by_settld']}\nPayments: {paid}\n"
-            f"Evidence: {', '.join(verified_evidence_refs)}\nYour follow-ups: 0")
-    return {**receipt, "whatsapp": notify_renter(card)}
+async def r_order_get(request):
+    return _resp(*pine_get_order(request.path_params["oid"]))
 
 
-@mcp.tool(annotations=WRITE)
-def reset_demo() -> dict:
-    """Clear all missions, claims, calls, bookings and payments (demo reset)."""
-    global S
-    S = _fresh_state()
-    return {"reset": True}
+async def r_refund(request):
+    return _resp(*pine_refund(request.path_params["oid"], await _json(request)))
 
+
+async def r_checkout(request):
+    lid = request.path_params["lid"]
+    l = PINE["links"].get(lid)
+    if not l:
+        return HTMLResponse("<h3>Payment link not found</h3>", status_code=404)
+    amt = l["amount"]["value"] / 100
+    done = l["status"] == "PROCESSED"
+    last = l.get("last_attempt", {})
+    msg = request.query_params.get("msg", "")
+    btns = "" if done else "".join(
+        f'<form method="post" action="/pinelabs/checkout/{lid}/pay"><input type="hidden" name="account" value="{k}">'
+        f'<button>Pay with UPI &middot; {n}</button></form>' for k, (n, _) in ACCOUNTS.items())
+    html = f"""<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pine Labs Checkout (UAT)</title><style>
+body{{font-family:system-ui,sans-serif;max-width:420px;margin:24px auto;padding:0 16px;color:#1d2433}}
+.card{{border:1px solid #dfe3eb;border-radius:14px;padding:20px}} .tag{{font-size:12px;color:#6b7385}}
+.amt{{font-size:34px;font-weight:700;margin:8px 0}} button{{width:100%;padding:14px;margin:8px 0;border:0;
+border-radius:10px;background:#0b5cff;color:#fff;font-size:15px}} .ok{{color:#0a7d3c}} .bad{{color:#c0262d}}</style></head>
+<body><div class="card"><div class="tag">Pine Labs Online &middot; UAT sandbox checkout</div>
+<div>{l['description'] or 'Payment'}</div><div class="amt">&#8377;{amt:,.2f}</div>
+<div class="tag">Ref {l['merchant_payment_link_reference']} &middot; Link {lid}</div>
+{f'<p class="ok"><b>Paid.</b> You can close this page.</p>' if done else ''}
+{f'<p class="bad">Last attempt failed: {last.get("reason")}</p>' if last.get("status") == "FAILED" else ''}
+{f'<p>{msg}</p>' if msg else ''}{btns}</div></body></html>"""
+    return HTMLResponse(html)
+
+
+async def r_checkout_pay(request):
+    lid = request.path_params["lid"]
+    form = urllib.parse.parse_qs((await request.body()).decode())
+    msg = pine_pay(lid, form.get("account", ["salary"])[0])
+    log("pinelabs", f"checkout {lid}: {msg}")
+    return RedirectResponse(f"/pinelabs/checkout/{lid}?msg={urllib.parse.quote(msg)}", status_code=303)
+
+
+async def r_health(request):
+    return JSONResponse({"service": "settld-v2", "at": ts(), "connectors": ["/gnani/mcp", "/telegram/mcp",
+                         "/delhivery/mcp", "/pinelabs/mcp", "/settld/mcp"], "sim": SIM,
+                         "gnani_key": bool(os.environ.get("GNANI_API_KEY")),
+                         "telegram_token": bool(os.environ.get("TELEGRAM_BOT_TOKEN"))})
+
+
+SERVERS = [gnani, telegram, delhivery, pinelabs, settld]
+
+
+@contextlib.asynccontextmanager
+async def lifespan(app):
+    async with contextlib.AsyncExitStack() as stack:
+        for s in SERVERS:
+            await stack.enter_async_context(s.session_manager.run())
+        yield
+
+
+routes = [
+    Route("/", r_health), Route("/health", r_health),
+    Route("/delhivery/c/api/pin-codes/json/", r_pin),
+    Route("/delhivery/api/kinko/v1/invoice/charges/.json", r_charges),
+    Route("/delhivery/waybill/api/fetch/json/", r_waybill),
+    Route("/delhivery/api/cmu/create.json", r_create, methods=["POST"]),
+    Route("/delhivery/fm/request/new/", r_pickup, methods=["POST"]),
+    Route("/delhivery/api/v1/packages/json/", r_track),
+    Route("/delhivery/api/p/update", r_ndr, methods=["POST"]),
+    Route("/delhivery/api/p/edit", r_edit, methods=["POST"]),
+    Route("/pinelabs/api/auth/v1/token", r_token, methods=["POST"]),
+    Route("/pinelabs/api/pay/v1/paymentlink", r_link_create, methods=["POST"]),
+    Route("/pinelabs/api/pay/v1/paymentlink/{lid}", r_link_get),
+    Route("/pinelabs/api/pay/v1/orders/{oid}", r_order_get),
+    Route("/pinelabs/api/pay/v1/refunds/{oid}", r_refund, methods=["POST"]),
+    Route("/pinelabs/checkout/{lid}", r_checkout),
+    Route("/pinelabs/checkout/{lid}/pay", r_checkout_pay, methods=["POST"]),
+]
+# MCP apps are mounted last so the REST routes above win on overlapping prefixes.
+for prefix, srv in (("/gnani", gnani), ("/telegram", telegram), ("/delhivery", delhivery),
+                    ("/pinelabs", pinelabs), ("/settld", settld)):
+    routes.append(Mount(prefix, app=srv.streamable_http_app()))
+
+app = Starlette(routes=routes, lifespan=lifespan)
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http")
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
