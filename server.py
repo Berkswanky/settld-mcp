@@ -19,6 +19,7 @@ State is in memory: it resets when the server restarts. Fine for a demo.
 import base64
 import os
 import threading
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -158,28 +159,38 @@ WA_LOG = []
 
 
 def _wa_send_now(body):
+    """Send one WhatsApp message via Twilio. Returns a short status string; never raises."""
     cfg = _wa_config()
     if not cfg:
-        return
+        return "disabled (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_FROM or RENTER_WHATSAPP missing)"
     sid, tok, frm, to = cfg
-    w = lambda n: n if n.startswith("whatsapp:") else f"whatsapp:{n}"
+    w = lambda n: n.replace(" ", "") if n.startswith("whatsapp:") else f"whatsapp:{n.replace(' ', '')}"
     data = urllib.parse.urlencode({"From": w(frm), "To": w(to), "Body": body[:1500]}).encode()
     req = urllib.request.Request(f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json", data=data)
     req.add_header("Authorization", "Basic " + base64.b64encode(f"{sid}:{tok}".encode()).decode())
     try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            WA_LOG.append({"at": _now().isoformat(timespec="seconds"), "status": r.status})
-    except Exception as e:  # never break the agent
-        WA_LOG.append({"at": _now().isoformat(timespec="seconds"), "error": str(e)[:200]})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            import json as _json
+            msg = _json.loads(r.read().decode() or "{}")
+            result = f"sent (twilio status {msg.get('status', r.status)}, sid {msg.get('sid', '?')})"
+    except urllib.error.HTTPError as e:
+        try:
+            import json as _json
+            err = _json.loads(e.read().decode() or "{}")
+            result = f"error {e.code}: twilio code {err.get('code')} - {err.get('message')}"
+        except Exception:
+            result = f"error {e.code}: {e.reason}"
+    except Exception as e:
+        result = f"error: {str(e)[:200]}"
+    WA_LOG.append({"at": _now().isoformat(timespec="seconds"), "from": w(frm), "to": w(to)[:-4] + "XXXX", "result": result})
     del WA_LOG[:-20]
+    print(f"[whatsapp] {result}", flush=True)
+    return result
 
 
 def notify_renter(body):
-    """Queue a WhatsApp card to the renter. Returns 'queued' or 'disabled'."""
-    if not _wa_config():
-        return "disabled"
-    threading.Thread(target=_wa_send_now, args=(body,), daemon=True).start()
-    return "queued"
+    """Send a WhatsApp card to the renter and return Twilio's result (or 'disabled')."""
+    return _wa_send_now(body)
 
 
 def _inr(x):
