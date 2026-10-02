@@ -1,6 +1,8 @@
+
+Server · PY
 """
 Settld MCP server — custom tools for the Settld tenancy agent on AgenticOrg.
-
+ 
 Rails covered (all MOCK / SANDBOX, scripted for demo scenarios):
   * Voice  (Gnani-style)          represent_counterparty, capture_commitment, chase_until_resolution
   * Logistics (Delhivery-style)   verify_location, create_physical_move, track_and_prove_delivery,
@@ -12,23 +14,23 @@ Rails covered (all MOCK / SANDBOX, scripted for demo scenarios):
                                   list_open_commitments, purpose_evidence_gate, create_closure_receipt
   * Payments (sandbox simulation) simulate_payment
   * Demo helpers                  list_demo_properties, reset_demo
-
+ 
 State is in memory: it resets when the server restarts. Fine for a demo.
 """
-
+ 
 import os
 import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-
+ 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
-
+ 
 IST = ZoneInfo("Asia/Kolkata")
 READ = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True)
 WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False)
-
+ 
 mcp = FastMCP(
     "settld-tools",
     instructions=(
@@ -42,17 +44,17 @@ mcp = FastMCP(
     json_response=True,
     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
 )
-
+ 
 # --------------------------------------------------------------------------------------
 # Demo data
 # --------------------------------------------------------------------------------------
-
+ 
 SOURCE_RANK = {"document": 1, "society": 2, "property_manager": 2, "owner": 3, "landlord": 3,
                "broker": 4, "listing": 5, "hearsay": 6}
 SOCIETY_FACTS = {"bachelors_allowed", "pets_allowed", "non_veg_allowed", "move_in_timings"}
 HEDGES = ["should be fine", "should be ok", "dekh lenge", "mostly", "i think", "probably",
           "maybe", "shayad", "ho jayega", "not sure"]
-
+ 
 # Scripted answers: PROPERTIES[pid]["script"][role][topic] -> (statement, value)
 PROPERTIES = {
     "P1": {
@@ -105,7 +107,7 @@ PROPERTIES = {
         },
     },
 }
-
+ 
 PROFESSIONALS = [
     {"professional_id": "PRO-RAVI", "name": "Ravi Plumbing Services", "category": "plumber", "rating": 4.7,
      "jobs_done": 812, "earliest_slot": "Today 16:00", "verified": True},
@@ -115,8 +117,8 @@ PROFESSIONALS = [
      "jobs_done": 1203, "earliest_slot": "Tomorrow 10:00", "verified": True},
 ]
 QUOTES = {"PRO-RAVI": 2400, "PRO-QFIX": 5800, "PRO-AMIT": 1800}
-
-
+ 
+ 
 ROLE_ALIASES = {
     "society": "society", "society_office": "society", "society office": "society", "rwa": "society",
     "society_secretary": "society", "secretary": "society", "society_manager": "society",
@@ -126,43 +128,45 @@ ROLE_ALIASES = {
     "vendor": "vendor", "professional": "vendor", "plumber": "vendor", "electrician": "vendor",
     "logistics": "logistics", "courier": "logistics", "document": "document", "listing": "listing",
 }
-
-
+ 
+ 
 def _role(r):
     """Normalise a counterparty/source role ("Society Office" -> "society")."""
     if not r:
         return r
     k = r.strip().lower().replace("-", "_")
     return ROLE_ALIASES.get(k) or ROLE_ALIASES.get(k.replace("_", " ")) or ROLE_ALIASES.get(k.split("_")[0], k)
-
-
+ 
+ 
 def _fresh_state():
     return {"missions": {}, "mandates": {}, "claims": [], "commitments": {}, "calls": {},
             "attempts": {}, "moves": {}, "quotes": {}, "bookings": {}, "payments": {},
             "gates": {}, "decisions": {}}
-
-
+ 
+ 
 S = _fresh_state()
-
-
+SERVER_STARTED_AT = datetime.now(IST).isoformat(timespec="seconds")
+SERVER_INSTANCE = uuid.uuid4().hex[:6].upper()
+ 
+ 
 def _now():
     return datetime.now(IST)
-
-
+ 
+ 
 def _id(prefix):
     return f"{prefix}-{uuid.uuid4().hex[:8].upper()}"
-
-
+ 
+ 
 def _log(mission_id, event, detail):
     m = S["missions"].get(mission_id)
     if m is not None:
         m["timeline"].append({"at": _now().isoformat(timespec="seconds"), "event": event, "detail": detail})
-
-
+ 
+ 
 # --------------------------------------------------------------------------------------
 # Mission store
 # --------------------------------------------------------------------------------------
-
+ 
 @mcp.tool(annotations=WRITE)
 def create_mission(mission_type: str, goal: str, hard_constraints: dict, closure_condition: str,
                    principals: list[str], soft_preferences: dict | None = None) -> dict:
@@ -177,8 +181,8 @@ def create_mission(mission_type: str, goal: str, hard_constraints: dict, closure
     _log(mid, "created", goal)
     return {"mission_id": mid, "state": "CAPTURE",
             "mission_card": f"MISSION CREATED\nGoal: {goal}\nHard constraints: {hard_constraints}\nYour action needed: None right now"}
-
-
+ 
+ 
 @mcp.tool(annotations=READ)
 def get_mission(mission_id: str) -> dict:
     """Get a mission with its state, timeline, claims and open commitments."""
@@ -188,12 +192,12 @@ def get_mission(mission_id: str) -> dict:
     return {**m,
             "claims": [c for c in S["claims"] if c["mission_id"] == mission_id],
             "open_commitments": [c for c in S["commitments"].values() if c["mission_id"] == mission_id and c["status"] == "open"]}
-
-
+ 
+ 
 VALID_STATES = ["CAPTURE", "VERIFY", "PLAN", "EXECUTE", "MONITOR", "VERIFY_OUTCOME", "CLOSED",
                 "HUMAN_REQUIRED", "BLOCKED", "CANCELLED"]
-
-
+ 
+ 
 @mcp.tool(annotations=WRITE)
 def update_mission_state(mission_id: str, new_state: str, reason: str) -> dict:
     """Move a mission to a new lifecycle state. Replans (any move back to PLAN) are capped at 5; the 6th
@@ -213,12 +217,12 @@ def update_mission_state(mission_id: str, new_state: str, reason: str) -> dict:
     m["state"] = new_state
     _log(mission_id, "state_change", f"{old} -> {new_state}: {reason}")
     return {"mission_id": mission_id, "from": old, "to": new_state, "replans": m["replans"], "reason": reason}
-
-
+ 
+ 
 # --------------------------------------------------------------------------------------
 # Mandate guard
 # --------------------------------------------------------------------------------------
-
+ 
 DEFAULT_MANDATE = {
     "rent_ceiling": 50000, "deposit_ceiling": 100000, "token_amount_limit": 10000,
     "repair_autonomous_limit": 3000, "monthly_spend_cap": 10000, "single_payment_hard_limit": 25000,
@@ -229,13 +233,13 @@ DEFAULT_MANDATE = {
     "expires_on": (datetime.now(IST) + timedelta(days=90)).date().isoformat(),
     "revoked": False,
 }
-
+ 
 ALWAYS_HUMAN = {"sign_agreement", "change_agreement", "pay_security_deposit", "waive_right",
                 "accept_deduction", "choose_property", "share_identity_document"}
 NEVER_DO = {"impersonate_human", "reveal_ceiling", "pay_without_gate", "delete_evidence"}
 CONTACT_ACTIONS = {"call", "message", "schedule_visit", "negotiate"}
-
-
+ 
+ 
 @mcp.tool(annotations=WRITE)
 def set_mandate(mission_id: str, overrides: dict | None = None) -> dict:
     """Set the renter's mandate for a mission. Unspecified fields use defaults (rent_ceiling 50000,
@@ -245,8 +249,8 @@ def set_mandate(mission_id: str, overrides: dict | None = None) -> dict:
     S["mandates"][mission_id] = mandate
     _log(mission_id, "mandate_set", str(overrides or "defaults"))
     return {"mission_id": mission_id, "mandate": mandate}
-
-
+ 
+ 
 @mcp.tool(annotations=WRITE)
 def enforce_mandate(mission_id: str, action_type: str, amount: float = 0, counterparty_role: str = "",
                     purpose: str = "", payee: str = "", at_time: str = "") -> dict:
@@ -258,7 +262,7 @@ def enforce_mandate(mission_id: str, action_type: str, amount: float = 0, counte
     md = S["mandates"].get(mission_id) or {**DEFAULT_MANDATE}
     counterparty_role = _role(counterparty_role)
     when = datetime.fromisoformat(at_time).astimezone(IST) if at_time else _now()
-
+ 
     def decide(decision, rule, note=""):
         did = _id("DEC")
         rec = {"decision_id": did, "mission_id": mission_id, "action_type": action_type, "amount": amount,
@@ -266,7 +270,7 @@ def enforce_mandate(mission_id: str, action_type: str, amount: float = 0, counte
         S["decisions"][did] = rec
         _log(mission_id, "mandate_decision", f"{action_type} {amount or ''} -> {decision} ({rule})")
         return rec
-
+ 
     if md.get("revoked"):
         return decide("DENY", "R1_mandate_revoked", "Renter revoked authority. Stop all actions.")
     if when.date().isoformat() > md["expires_on"]:
@@ -277,17 +281,17 @@ def enforce_mandate(mission_id: str, action_type: str, amount: float = 0, counte
         return decide("HUMAN_REQUIRED", "R3_always_ask", "This action always needs the renter (all principals if contractual).")
     if counterparty_role and counterparty_role not in md["allowed_counterparties"]:
         return decide("HUMAN_REQUIRED", "R4_counterparty_not_allowed")
-
+ 
     # Quiet hours apply to contacting people.
     if action_type in CONTACT_ACTIONS:
         h = when.hour + when.minute / 60
         if h >= 20 or h < 9:
             nxt = (when + timedelta(days=1 if h >= 20 else 0)).replace(hour=9, minute=0, second=0, microsecond=0)
             return decide("DENY", "R7_quiet_hours", f"Reschedule to {nxt.isoformat(timespec='minutes')}")
-
+ 
     if action_type in ("accept_rent", "negotiate") and amount and amount > md["rent_ceiling"]:
         return decide("HUMAN_REQUIRED", "R5_rent_above_ceiling", f"{amount} > ceiling {md['rent_ceiling']}")
-
+ 
     if action_type.startswith("pay_"):
         srm = md.get("standing_rent_mandate") or {}
         if action_type == "pay_rent" and srm.get("payee") and payee == srm["payee"] and amount <= (srm.get("amount") or 0):
@@ -304,14 +308,14 @@ def enforce_mandate(mission_id: str, action_type: str, amount: float = 0, counte
         if spent + amount > md["monthly_spend_cap"]:
             return decide("HUMAN_REQUIRED", "R5_monthly_cap", f"spent {spent} + {amount} > {md['monthly_spend_cap']}")
         return decide("ALLOW", "R9_within_mandate", "Payment still needs purpose_evidence_gate before release.")
-
+ 
     return decide("ALLOW", "R9_within_mandate")
-
-
+ 
+ 
 # --------------------------------------------------------------------------------------
 # Claims ledger (Verifier)
 # --------------------------------------------------------------------------------------
-
+ 
 def _classify(source_role, statement, value):
     rank = SOURCE_RANK.get(source_role, 6)
     hedged = any(h in statement.lower() for h in HEDGES)
@@ -322,8 +326,8 @@ def _classify(source_role, statement, value):
     if value is False:
         return "failed", rank, "Clear 'no' from an authoritative source."
     return "verified", rank, "Clear answer from an authoritative source."
-
-
+ 
+ 
 def _fact_status(mission_id, subject_id, fact):
     cs = [c for c in S["claims"] if c["mission_id"] == mission_id and c["subject_id"] == subject_id and c["fact"] == fact]
     if not cs:
@@ -352,8 +356,8 @@ def _fact_status(mission_id, subject_id, fact):
         if lower_disagree:
             reason += f" Lower-ranked sources said otherwise ({', '.join(lower_disagree)}); kept on record."
     return {"fact": fact, "subject_id": subject_id, "status": status, "reason": reason, "claims": cs}
-
-
+ 
+ 
 @mcp.tool(annotations=WRITE)
 def add_claim(mission_id: str, subject_id: str, fact: str, value: bool | int | float | str | None,
               source_role: str, statement: str, channel: str = "call", evidence_ref: str = "") -> dict:
@@ -369,27 +373,27 @@ def add_claim(mission_id: str, subject_id: str, fact: str, value: bool | int | f
     S["claims"].append(claim)
     _log(mission_id, "claim", f"{subject_id}.{fact}={value} from {source_role} -> {status}")
     return {"claim": claim, "fact_status": _fact_status(mission_id, subject_id, fact)}
-
-
+ 
+ 
 @mcp.tool(annotations=READ)
 def get_fact_status(mission_id: str, subject_id: str, fact: str) -> dict:
     """Combined status of a fact for a property/job: verified, unknown, contested or failed, with all claims
     (who said what, when) for the 'Why?' explanation."""
     return _fact_status(mission_id, subject_id, fact)
-
-
+ 
+ 
 # --------------------------------------------------------------------------------------
 # Voice (Gnani-style)
 # --------------------------------------------------------------------------------------
-
+ 
 @mcp.tool(annotations=READ)
 def list_demo_properties() -> dict:
     """List demo property leads (P1-P4) with listed rent and contacts. Listing data is rank 5: leads only."""
     return {"properties": [{"property_id": k, "name": v["name"], "address": v["address"], "bhk": v["bhk"],
                             "listed_rent": v["rent"], "listed_deposit": v["deposit"], "contacts": v["contacts"]}
                            for k, v in PROPERTIES.items()]}
-
-
+ 
+ 
 @mcp.tool(annotations=WRITE)
 def represent_counterparty(mission_id: str, property_id: str, counterparty_role: str, question_topic: str,
                            language: str = "hinglish") -> dict:
@@ -427,8 +431,8 @@ def represent_counterparty(mission_id: str, property_id: str, counterparty_role:
     S["calls"][call_id] = rec
     _log(mission_id, "call", f"{who} ({counterparty_role}) {question_topic}: {rec['disposition']}")
     return rec
-
-
+ 
+ 
 @mcp.tool(annotations=WRITE)
 def capture_commitment(call_id: str) -> dict:
     """Extract commitments (who promised what, by when) from a call transcript. Vague promises
@@ -448,8 +452,8 @@ def capture_commitment(call_id: str) -> dict:
         out.append({"who": c["counterparty"], "what": "Call not answered", "by_when": None, "firm": False,
                     "note": "Retry per chase policy."})
     return {"call_id": call_id, "commitments": out}
-
-
+ 
+ 
 @mcp.tool(annotations=WRITE)
 def add_commitment(mission_id: str, who: str, what: str, by_when: str = "", firm: bool = True) -> dict:
     """Register a commitment for the Chaser to track."""
@@ -458,14 +462,14 @@ def add_commitment(mission_id: str, who: str, what: str, by_when: str = "", firm
                              "by_when": by_when or None, "firm": firm, "status": "open", "attempts": 0}
     _log(mission_id, "commitment", f"{who}: {what} by {by_when or 'unspecified'}")
     return S["commitments"][cid]
-
-
+ 
+ 
 @mcp.tool(annotations=READ)
 def list_open_commitments(mission_id: str) -> dict:
     """List open commitments for a mission."""
     return {"open": [c for c in S["commitments"].values() if c["mission_id"] == mission_id and c["status"] == "open"]}
-
-
+ 
+ 
 @mcp.tool(annotations=WRITE)
 def chase_until_resolution(commitment_id: str, outcome: str = "pending") -> dict:
     """Chase policy for an open commitment. outcome: pending | fulfilled | missed.
@@ -492,12 +496,12 @@ def chase_until_resolution(commitment_id: str, outcome: str = "pending") -> dict
     return {"commitment_id": commitment_id, "status": "open", "attempt": c["attempts"],
             "next_channel": channels[idx], "next_attempt_at": nxt.isoformat(timespec="minutes"),
             "tip": "Use the Agent Scheduler connector to schedule the follow-up at next_attempt_at."}
-
-
+ 
+ 
 # --------------------------------------------------------------------------------------
 # Logistics (Delhivery-style)
 # --------------------------------------------------------------------------------------
-
+ 
 @mcp.tool(annotations=READ)
 def verify_location(address: str) -> dict:
     """Validate and standardise an address (sandbox). Delivery history is never proof of tenancy eligibility."""
@@ -507,8 +511,8 @@ def verify_location(address: str) -> dict:
     return {"valid": True, "standardised": address.strip().title(), "pincode": pin or "unknown",
             "coordinates": {"lat": 19.1 + (hash(address) % 100) / 1000, "lng": 72.85 + (hash(address) % 50) / 1000},
             "serviceable": True}
-
-
+ 
+ 
 @mcp.tool(annotations=WRITE)
 def create_physical_move(mission_id: str, pickup_address: str, drop_address: str, items: list[str],
                          date: str, slot: str, idempotency_key: str) -> dict:
@@ -523,8 +527,8 @@ def create_physical_move(mission_id: str, pickup_address: str, drop_address: str
                       "status": "PICKUP_SCHEDULED", "track_calls": 0, "rescheduled": False, "scans": []}
     _log(mission_id, "logistics_booked", f"{wb} {date} {slot}")
     return S["moves"][wb]
-
-
+ 
+ 
 @mcp.tool(annotations=READ)
 def track_and_prove_delivery(waybill: str) -> dict:
     """Track a shipment. Demo script: first pickup attempt fails (NDR: customer not available) unless
@@ -543,8 +547,8 @@ def track_and_prove_delivery(waybill: str) -> dict:
             m["pod"] = {"signed_by": "Security desk", "photo_ref": f"pod://{waybill}", "at": _now().isoformat(timespec="minutes")}
     m["scans"].append({"status": m["status"], "at": _now().isoformat(timespec="minutes")})
     return {**m, "closure_note": "Rail status is evidence only. Ask renter to confirm receipt."}
-
-
+ 
+ 
 @mcp.tool(annotations=WRITE)
 def recover_logistics_failure(waybill: str, action: str, new_date: str = "", new_slot: str = "") -> dict:
     """Recover a failed pickup/delivery. action: RE-ATTEMPT | PICKUP_RESCHEDULE (only supported NDR actions)."""
@@ -564,19 +568,19 @@ def recover_logistics_failure(waybill: str, action: str, new_date: str = "", new
         m["slot"] = new_slot
     _log(m["mission_id"], "logistics_recovered", f"{waybill} {action}")
     return m
-
-
+ 
+ 
 # --------------------------------------------------------------------------------------
 # Field service (Urban Company mock)
 # --------------------------------------------------------------------------------------
-
+ 
 @mcp.tool(annotations=READ)
 def find_professional(category: str, location: str = "Mumbai") -> dict:
     """Find verified home-service professionals. category: plumber | electrician."""
     pros = [p for p in PROFESSIONALS if p["category"] == category.lower()]
     return {"category": category, "location": location, "professionals": pros}
-
-
+ 
+ 
 @mcp.tool(annotations=WRITE)
 def get_quote(mission_id: str, professional_id: str, problem: str) -> dict:
     """Get an itemised quote (sandbox). Demo: Ravi Plumbing quotes 2,400; QuickFix quotes 5,800."""
@@ -591,8 +595,8 @@ def get_quote(mission_id: str, professional_id: str, problem: str) -> dict:
                         "valid_hours": 24}
     _log(mission_id, "quote", f"{professional_id}: {total}")
     return S["quotes"][qid]
-
-
+ 
+ 
 @mcp.tool(annotations=WRITE)
 def book_visit(quote_id: str, slot: str, idempotency_key: str) -> dict:
     """Book a professional against a quote. Call enforce_mandate first. Idempotent on idempotency_key."""
@@ -605,11 +609,12 @@ def book_visit(quote_id: str, slot: str, idempotency_key: str) -> dict:
     bid = _id("BKG")
     S["bookings"][bid] = {"booking_id": bid, "quote_id": quote_id, "mission_id": q["mission_id"],
                           "professional_id": q["professional_id"], "slot": slot, "amount": q["total"],
-                          "status": "BOOKED", "visits": 0, "reworks": 0, "idempotency_key": idempotency_key}
+                          "status": "BOOKED", "visits": 0, "reworks": 0, "idempotency_key": idempotency_key,
+                          "server_instance": SERVER_INSTANCE}
     _log(q["mission_id"], "booked", f"{bid} {slot}")
     return S["bookings"][bid]
-
-
+ 
+ 
 @mcp.tool(annotations=WRITE)
 def capture_completion(booking_id: str) -> dict:
     """Professional marks the job complete with before/after photos. This is NOT the outcome check —
@@ -622,8 +627,8 @@ def capture_completion(booking_id: str) -> dict:
     _log(b["mission_id"], "completion_claimed", booking_id)
     return {"booking_id": booking_id, "status": b["status"], "professional_notes": "Replaced washer and sealed joint.",
             "photos": [f"photo://{booking_id}/before", f"photo://{booking_id}/after"], "warranty_days": 30}
-
-
+ 
+ 
 @mcp.tool(annotations=READ)
 def check_fix_status(booking_id: str) -> dict:
     """Independent outcome check (renter photo + 24h re-check, simulated). Demo: after the first visit the
@@ -637,9 +642,10 @@ def check_fix_status(booking_id: str) -> dict:
     return {"booking_id": booking_id, "fixed": fixed, "status": b["status"],
             "evidence": {"renter_photo": f"photo://{booking_id}/renter-check-{b['visits']}",
                          "checked_after_hours": 24},
-            "next": "purpose_evidence_gate then pay" if fixed else "request_rework (do not pay)"}
-
-
+            "next": "purpose_evidence_gate then pay" if fixed else "request_rework (do not pay)",
+            "server_instance": SERVER_INSTANCE}
+ 
+ 
 @mcp.tool(annotations=WRITE)
 def request_rework(booking_id: str, failure_evidence: str) -> dict:
     """Request rework at no extra cost after a failed outcome check. After 2 failed reworks, switch vendor."""
@@ -652,12 +658,12 @@ def request_rework(booking_id: str, failure_evidence: str) -> dict:
     b["status"] = "REWORK_BOOKED"
     _log(b["mission_id"], "rework", f"{booking_id} #{b['reworks']}: {failure_evidence}")
     return {"booking_id": booking_id, "status": b["status"], "rework_number": b["reworks"], "extra_cost": 0}
-
-
+ 
+ 
 # --------------------------------------------------------------------------------------
 # Payments (sandbox simulation) + purpose/evidence gate
 # --------------------------------------------------------------------------------------
-
+ 
 @mcp.tool(annotations=WRITE)
 def purpose_evidence_gate(mission_id: str, purpose: str, payee: str, amount: float, evidence_ref: str) -> dict:
     """Release check before any payment: the purpose's real-world condition must be verified.
@@ -665,10 +671,20 @@ def purpose_evidence_gate(mission_id: str, purpose: str, payee: str, amount: flo
     verified for the property, evidence_ref=property_id) | rent (evidence_ref=agreement or mandate ref).
     Paying merely because the amount is under the cap is never enough."""
     ok, why = False, ""
+    diag = {}
     if purpose == "repair":
-        b = S["bookings"].get(evidence_ref)
-        ok = bool(b and b["status"] == "VERIFIED_FIXED" and b["amount"] == amount)
-        why = "Fix verified and amount matches quote." if ok else "Fix not verified or amount mismatch. Hold payment."
+        b = S["bookings"].get(evidence_ref.strip())
+        if not b:
+            why = (f"Booking {evidence_ref} not found on this server (known bookings: {list(S['bookings']) or 'none'}). "
+                   "Hold payment.")
+        elif b["status"] != "VERIFIED_FIXED":
+            why = f"Fix not verified: booking status is {b['status']}. Run check_fix_status first. Hold payment."
+        elif float(b["amount"]) != float(amount):
+            why = f"Amount mismatch: quote was {b['amount']}, request is {amount}. Hold payment."
+        else:
+            ok, why = True, "Fix verified and amount matches quote."
+        diag = {"booking_found": bool(b), "booking_status": b["status"] if b else None,
+                "quoted_amount": b["amount"] if b else None}
     elif purpose == "token":
         m = S["missions"].get(mission_id, {})
         facts = [k for k in m.get("hard_constraints", {}) if k == "bachelors_allowed"] or ["bachelors_allowed"]
@@ -681,11 +697,12 @@ def purpose_evidence_gate(mission_id: str, purpose: str, payee: str, amount: flo
         why = "Unknown purpose. Hold payment and ask renter."
     gid = _id("GATE")
     S["gates"][gid] = {"gate_id": gid, "mission_id": mission_id, "purpose": purpose, "payee": payee,
-                       "amount": amount, "condition_met": ok, "why": why}
+                       "amount": amount, "condition_met": ok, "why": why, "diagnostics": diag,
+                       "server_instance": SERVER_INSTANCE, "server_started_at": SERVER_STARTED_AT}
     _log(mission_id, "evidence_gate", f"{purpose} {amount} -> {'PASS' if ok else 'HOLD'}")
     return S["gates"][gid]
-
-
+ 
+ 
 @mcp.tool(annotations=WRITE)
 def simulate_payment(mission_id: str, payee: str, amount: float, purpose: str, mandate_decision_id: str,
                      gate_id: str, idempotency_key: str, approved_by_human: str = "") -> dict:
@@ -713,12 +730,12 @@ def simulate_payment(mission_id: str, payee: str, amount: float, purpose: str, m
                           "at": _now().isoformat(timespec="seconds")}
     _log(mission_id, "payment", f"{purpose} {amount} to {payee} SUCCESS (sandbox)")
     return S["payments"][pid]
-
-
+ 
+ 
 # --------------------------------------------------------------------------------------
 # Closure + demo helpers
 # --------------------------------------------------------------------------------------
-
+ 
 @mcp.tool(annotations=WRITE)
 def create_closure_receipt(mission_id: str, outcome_summary: str, verified_evidence_refs: list[str],
                            renter_confirmed: bool) -> dict:
@@ -739,15 +756,16 @@ def create_closure_receipt(mission_id: str, outcome_summary: str, verified_evide
     m["receipt"] = receipt
     _log(mission_id, "receipt", outcome_summary)
     return receipt
-
-
+ 
+ 
 @mcp.tool(annotations=WRITE)
 def reset_demo() -> dict:
     """Clear all missions, claims, calls, bookings and payments (demo reset)."""
     global S
     S = _fresh_state()
     return {"reset": True}
-
-
+ 
+ 
 if __name__ == "__main__":
     mcp.run(transport="streamable-http")
+ 
