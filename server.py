@@ -165,7 +165,26 @@ def _wa_send_now(body):
         return "disabled (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_FROM or RENTER_WHATSAPP missing)"
     sid, tok, frm, to = cfg
     w = lambda n: n.replace(" ", "") if n.startswith("whatsapp:") else f"whatsapp:{n.replace(' ', '')}"
-    data = urllib.parse.urlencode({"From": w(frm), "To": w(to), "Body": body[:1500]}).encode()
+    fields = {"From": w(frm), "To": w(to)}
+    content_sid = os.environ.get("TWILIO_CONTENT_SID", "").strip()
+    if content_sid:
+        # Template mode: WhatsApp template variables cannot contain newlines, so flatten the card.
+        import json as _json
+        lines = [x.strip() for x in body.replace("*", "").split("\n") if x.strip()]
+        title = lines[0] if lines else "Settld update"
+        detail = " | ".join(lines[1:]) or title
+        full = " | ".join(lines)
+        mapping = os.environ.get("TWILIO_CONTENT_VARIABLES", '{"1": "{full}"}')
+        try:
+            tmpl = _json.loads(mapping)
+        except Exception:
+            tmpl = {"1": "{full}"}
+        vars_ = {k: str(v).replace("{full}", full).replace("{title}", title).replace("{detail}", detail)[:1000]
+                 for k, v in tmpl.items()}
+        fields.update({"ContentSid": content_sid, "ContentVariables": _json.dumps(vars_)})
+    else:
+        fields["Body"] = body[:1500]
+    data = urllib.parse.urlencode(fields).encode()
     req = urllib.request.Request(f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json", data=data)
     req.add_header("Authorization", "Basic " + base64.b64encode(f"{sid}:{tok}".encode()).decode())
     try:
