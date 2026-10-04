@@ -316,17 +316,19 @@ delhivery = new_mcp("delhivery-mock", "Delhivery B2C API mock. Each tool calls t
 
 
 @delhivery.tool(annotations=READ)
-def pincode_serviceability(filter_codes: str) -> dict:
+def pincode_serviceability(filter_codes: str | int) -> dict:
     """GET /c/api/pin-codes/json/?filter_codes=<pin>. Empty delivery_codes = not serviceable. pickup='N' = no pickup."""
+    filter_codes = str(filter_codes).strip()
     log("delhivery", f"GET /c/api/pin-codes/json/?filter_codes={filter_codes}")
     return dlv_pincode(filter_codes)
 
 
 @delhivery.tool(annotations=READ)
-def calculate_shipping_cost(md: str, ss: str, d_pin: str, o_pin: str, cgm: int, pt: str = "Pre-paid") -> dict:
+def calculate_shipping_cost(md: str, ss: str, d_pin: str | int, o_pin: str | int, cgm: int | float | str,
+                            pt: str = "Pre-paid") -> dict:
     """GET /api/kinko/v1/invoice/charges/.json. md: E (Express) or S (Surface). ss: Delivered. cgm: chargeable grams."""
     log("delhivery", f"GET /api/kinko/v1/invoice/charges/.json?md={md}&o_pin={o_pin}&d_pin={d_pin}&cgm={cgm}")
-    r = dlv_charges(md, ss, d_pin, o_pin, cgm, pt)
+    r = dlv_charges(md, ss, str(d_pin).strip(), str(o_pin).strip(), float(cgm), pt)
     return {"response": r}
 
 
@@ -348,7 +350,7 @@ def create_shipment(shipments: list[dict], pickup_location: dict) -> dict:
 
 
 @delhivery.tool(annotations=WRITE)
-def create_pickup_request(pickup_location: str, pickup_time: str, pickup_date: str, expected_package_count: int) -> dict:
+def create_pickup_request(pickup_location: str, pickup_time: str, pickup_date: str, expected_package_count: int | str) -> dict:
     """POST /fm/request/new/. pickup_time HH:MM:SS (10:00:00-18:00:00), pickup_date YYYY-MM-DD.
     May fail with error.code NO_RIDER_AVAILABLE and a next_available_slot."""
     log("delhivery", f"POST /fm/request/new/ {pickup_date} {pickup_time}")
@@ -358,12 +360,12 @@ def create_pickup_request(pickup_location: str, pickup_time: str, pickup_date: s
 
 
 @delhivery.tool(annotations=READ)
-def track_shipment(waybill: str = "", ref_ids: str = "") -> dict:
+def track_shipment(waybill: str | int = "", ref_ids: str | int = "") -> dict:
     """GET /api/v1/packages/json/?waybill=<awb> or ?ref_ids=<order id>. The body may be malformed (not valid JSON);
     if so, report it and retry later. Status.StatusType DL = delivered. Status 'Pending' with an NDR instruction
     = delivery failed and needs an NDR action."""
     log("delhivery", f"GET /api/v1/packages/json/?waybill={waybill}&ref_ids={ref_ids}")
-    code, body = dlv_track(waybill or None, ref_ids or None)
+    code, body = dlv_track(str(waybill) if waybill else None, str(ref_ids) if ref_ids else None)
     if isinstance(body, str):
         return {"http_status": code, "content_type": "application/json", "raw_body": body,
                 "parse_error": "Expecting ',' delimiter: unterminated string (malformed JSON)"}
@@ -371,11 +373,11 @@ def track_shipment(waybill: str = "", ref_ids: str = "") -> dict:
 
 
 @delhivery.tool(annotations=WRITE)
-def ndr_update(waybill: str, act: str, action_data: dict | None = None) -> dict:
+def ndr_update(waybill: str | int, act: str, action_data: dict | None = None) -> dict:
     """POST /api/p/update {"data":[{"waybill","act","action_data"}]}. act: RE-ATTEMPT, DEFER_DLV (action_data
     {"deferred_date":"YYYY-MM-DD"}) or EDIT_DETAILS (action_data {name, add, phone}). Only valid in NDR state."""
     log("delhivery", f"POST /api/p/update waybill={waybill} act={act}")
-    item = {"waybill": waybill, "act": act}
+    item = {"waybill": str(waybill), "act": act}
     if action_data:
         item["action_data"] = action_data
     code, body = dlv_ndr({"data": [item]})
@@ -383,10 +385,10 @@ def ndr_update(waybill: str, act: str, action_data: dict | None = None) -> dict:
 
 
 @delhivery.tool(annotations=WRITE)
-def cancel_shipment(waybill: str) -> dict:
+def cancel_shipment(waybill: str | int) -> dict:
     """POST /api/p/edit {"waybill": ..., "cancellation": "true"}. Fails once the shipment is picked up."""
     log("delhivery", f"POST /api/p/edit waybill={waybill} cancellation=true")
-    code, body = dlv_cancel({"waybill": waybill, "cancellation": "true"})
+    code, body = dlv_cancel({"waybill": str(waybill), "cancellation": "true"})
     return {"http_status": code, "body": body}
 
 
@@ -499,12 +501,13 @@ def generate_token(client_id: str = "settld_uat", client_secret: str = "***", gr
 
 
 @pinelabs.tool(annotations=WRITE)
-def create_payment_link(amount_value: int, merchant_payment_link_reference: str, description: str = "",
-                        customer_name: str = "", customer_mobile: str = "", expire_by: str = "") -> dict:
+def create_payment_link(amount_value: int | float | str, merchant_payment_link_reference: str, description: str = "",
+                        customer_name: str = "", customer_mobile: str | int = "", expire_by: str = "") -> dict:
     """POST /api/pay/v1/paymentlink {"amount":{"value":<paisa>,"currency":"INR"}, "merchant_payment_link_reference",
     "description", "customer", "expire_by"}. Returns payment_link (URL to send to the customer), payment_link_id,
     order_id, status CREATED. Reusing a reference returns 409 DUPLICATE_REQUEST with the existing id."""
     log("pinelabs", f"POST /api/pay/v1/paymentlink ref={merchant_payment_link_reference} value={amount_value}")
+    amount_value = int(round(float(amount_value)))
     code, body = pine_create_link({"amount": {"value": amount_value, "currency": "INR"},
                                    "merchant_payment_link_reference": merchant_payment_link_reference,
                                    "description": description, "expire_by": expire_by or None,
@@ -755,11 +758,13 @@ settld = new_mcp("settld-capabilities", "Settld capabilities that no rail offers
 
 
 @settld.tool(annotations=WRITE)
-def pine_mandate_evaluate(mission_id: str, purpose: str, amount_value: int, payee: str = "") -> dict:
+def pine_mandate_evaluate(mission_id: str, purpose: str, amount_value: int | float | str, payee: str = "") -> dict:
     """[Capability 1 — Pine Labs, proposed POST /api/pay/v1/mandates/evaluate]
     Check a payment against the renter's mandate before creating it. Returns decision ALLOW (within budget and
     purpose), HUMAN_REQUIRED (needs the renter's explicit yes) or DENY, with the rule that fired.
     amount_value in paisa. Mandate comes from mission memory: budget_paisa, allowed_purposes."""
+    amount_value = int(round(float(amount_value)))
+    waybill_unused = None
     m = MEM["missions"].get(mission_id, {})
     mandate = m.get("mandate") or {}
     budget = int(mandate.get("budget_paisa") or 0)
@@ -781,7 +786,7 @@ def pine_mandate_evaluate(mission_id: str, purpose: str, amount_value: int, paye
 
 
 @settld.tool(annotations=WRITE)
-def pine_conditional_release(mission_id: str, order_id: str, waybill: str, renter_confirmed: bool,
+def pine_conditional_release(mission_id: str, order_id: str, waybill: str | int, renter_confirmed: bool,
                              renter_confirmation_text: str = "") -> dict:
     """[Capability 2 — Pine Labs, proposed POST /api/pay/v1/settlements/conditional-release]
     Release the renter's captured payment to the logistics payee ONLY when the purpose is fulfilled: the Pine
@@ -789,8 +794,9 @@ def pine_conditional_release(mission_id: str, order_id: str, waybill: str, rente
     Otherwise the money stays HELD (or should be refunded). Idempotent per order_id."""
     if order_id in MEM["releases"]:
         return {**MEM["releases"][order_id], "note": "already decided (idempotent)"}
+    waybill = str(waybill)
     o = PINE["orders"].get(order_id)
-    s = DLV["shipments"].get(str(waybill))
+    s = DLV["shipments"].get(waybill)
     checks = {"payment_processed": bool(o and o["status"] == "PROCESSED"),
               "delivered": bool(s and s.get("status", {}).get("StatusType") == "DL"),
               "renter_confirmed": bool(renter_confirmed)}
