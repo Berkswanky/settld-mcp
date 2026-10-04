@@ -1,3 +1,4 @@
 mcp==1.30.0
 uvicorn==0.54.0
 gnani-vachana==0.7.9
+imageio-ffmpeg==0.6.0

@@ -640,6 +640,18 @@ def send_renter_voice(audio_id: str, caption: str = "", buttons: list[str] | Non
 # ======================================================================================
 # GNANI (real) — speech-to-text and text-to-speech
 # ======================================================================================
+def _to_wav16k(audio_bytes):
+    """Convert any audio (e.g. Telegram OGG/Opus) to 16 kHz mono 16-bit WAV with a bundled ffmpeg."""
+    import subprocess
+    import imageio_ffmpeg
+    p = subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
+                        "-ac", "1", "-ar", "16000", "-sample_fmt", "s16", "-f", "wav", "pipe:1"],
+                       input=audio_bytes, capture_output=True, timeout=30)
+    if p.returncode != 0 or not p.stdout:
+        raise RuntimeError("audio conversion failed: " + p.stderr.decode()[:150])
+    return p.stdout
+
+
 gnani = new_mcp("gnani-settld", "Real Gnani (Vachana) speech APIs. speech_to_text transcribes the renter's Telegram "
                 "voice note (Hinglish supported); text_to_speech turns Settld's reply into a voice note.")
 
@@ -658,13 +670,22 @@ def speech_to_text(telegram_file_id: str, language_code: str = "") -> dict:
         return {"success": False, "error": f"could not download voice note: {str(e)[:150]}"}
     try:
         from gnani.stt import GnaniSTTClient
+        client = GnaniSTTClient(api_key=key)
         t0 = time.time()
-        res = GnaniSTTClient(api_key=key).transcribe_bytes(audio, filename=os.path.basename(path) or "voice.ogg",
-                                                           language_code=lang)
-        log("gnani", f"STT {lang} {len(audio)}B -> {str(res.get('transcript'))[:80]}")
+        # Telegram voice notes are OGG/Opus saved as .oga; Gnani accepts ogg but checks the extension.
+        try:
+            res = client.transcribe_bytes(audio, filename="voice.ogg", language_code=lang)
+            sent_as = "ogg"
+        except Exception as e1:
+            if "UNSUPPORTED_AUDIO_FORMAT" not in str(e1) and "400" not in str(e1):
+                raise
+            log("gnani", f"STT ogg rejected ({str(e1)[:80]}); converting to 16 kHz mono WAV")
+            res = client.transcribe_bytes(_to_wav16k(audio), filename="voice.wav", language_code=lang)
+            sent_as = "wav (converted)"
+        log("gnani", f"STT {lang} {sent_as} {len(audio)}B -> {str(res.get('transcript'))[:80]}")
         return {"success": bool(res.get("success", True)), "transcript": res.get("transcript", ""),
                 "language_code": lang, "request_id": res.get("request_id"),
-                "latency_ms": int((time.time() - t0) * 1000),
+                "latency_ms": int((time.time() - t0) * 1000), "sent_as": sent_as,
                 "audio_sha256": hashlib.sha256(audio).hexdigest()[:16]}
     except Exception as e:
         log("gnani", f"STT error {e}")
