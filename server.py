@@ -98,25 +98,44 @@ PINCODES = {
 DLV = {"shipments": {}, "orders": {}, "pickups": {}, "pickup_attempts": {}, "ndr": {}, "creates": {}}
 
 
+NON_SERVICEABLE = {"194101", "194103", "744101", "737101", "799001"}   # remote pins: not serviceable
+DISTRICTS = {"400": ("Mumbai", "MH", "BOM"), "401": ("Thane", "MH", "THN"), "410": ("Raigad", "MH", "PNV"),
+             "411": ("Pune", "MH", "PNQ"), "560": ("Bengaluru", "KA", "BLR"), "110": ("New Delhi", "DL", "DEL"),
+             "122": ("Gurugram", "HR", "GGN"), "500": ("Hyderabad", "TG", "HYD"), "600": ("Chennai", "TN", "MAA"),
+             "700": ("Kolkata", "WB", "CCU"), "380": ("Ahmedabad", "GJ", "AMD")}
+
+
+def _pin_info(pin):
+    pin = str(pin).strip()
+    if not (len(pin) == 6 and pin.isdigit() and pin[0] in "12345678") or pin in NON_SERVICEABLE:
+        return None
+    if pin in PINCODES:
+        d, st, sc, pk = PINCODES[pin]
+        return d, st, sc, pk
+    d, st, sc = DISTRICTS.get(pin[:3], ("Other", "NA", "OTH"))
+    return d, st, f"{sc}/{pin[3:]}", "Y"
+
+
 def dlv_pincode(filter_codes):
-    pin = str(filter_codes).strip()
-    if pin not in PINCODES:
+    info = _pin_info(filter_codes)
+    if not info:
         return {"delivery_codes": []}
-    district, state, sort_code, pickup = PINCODES[pin]
+    district, state, sort_code, pickup = info
     return {"delivery_codes": [{"postal_code": {
-        "district": district, "pin": int(pin), "max_amount": 0.0, "pre_paid": "Y", "cash": "Y",
+        "district": district, "pin": int(str(filter_codes).strip()), "max_amount": 0.0, "pre_paid": "Y", "cash": "Y",
         "pickup": pickup, "repl": "Y", "cod": "Y", "country_code": "IN", "sort_code": sort_code,
         "is_oda": "N", "state_code": state, "max_weight": 0.0}}]}
 
 
 def dlv_charges(md, ss, d_pin, o_pin, cgm, pt="Pre-paid"):
     """GET /api/kinko/v1/invoice/charges/.json  md=E (Express) or S (Surface), cgm = grams."""
-    if str(d_pin) not in PINCODES or str(o_pin) not in PINCODES:
+    di, oi = _pin_info(d_pin), _pin_info(o_pin)
+    if not di or not oi:
         return {"error": "Non-serviceable pincode", "status": "FAILURE"}
     kg = max(0.5, float(cgm) / 1000)
-    same_city = PINCODES[str(d_pin)][0] == PINCODES[str(o_pin)][0] or {PINCODES[str(d_pin)][0], PINCODES[str(o_pin)][0]} <= {"Mumbai", "Thane"}
-    zone = "A" if same_city else "B"
-    per_kg = (38 if md == "E" else 24) * (1 if zone == "A" else 1.6)
+    d_pin, o_pin = str(d_pin), str(o_pin)
+    zone = "A" if d_pin[:2] == o_pin[:2] else ("B" if di[1] == oi[1] else "C")
+    per_kg = (38 if md == "E" else 24) * {"A": 1, "B": 1.6, "C": 2.4}[zone]
     freight = round(per_kg * kg, 2)
     fuel = round(freight * 0.12, 2)
     gross = round(freight + fuel + 30, 2)
@@ -147,7 +166,7 @@ def dlv_create(data):
                      "packages": [{"status": "Fail", "client": "SETTLD", "remarks": ["Duplicate order id"],
                                    "waybill": "", "refnum": order, "serviceable": True}],
                      "rmk": "Duplicate order id"}
-    if pin not in PINCODES:
+    if not _pin_info(pin):
         return 200, {"success": False, "package_count": 1, "packages": [{"status": "Fail", "remarks": ["Non serviceable pincode"],
                      "waybill": "", "refnum": order, "serviceable": False}], "rmk": "Non serviceable pincode"}
     wb = str(s.get("waybill") or dlv_fetch_waybill())
@@ -161,7 +180,7 @@ def dlv_create(data):
     _scan(wb, "Manifested", "UD", "Shipment manifested, awaiting pickup")
     resp = {"cash_pickups_count": 0, "package_count": 1, "upload_wbn": "UPL" + uuid.uuid4().hex[:15].upper(),
             "replacement_count": 0, "pickups_count": 0,
-            "packages": [{"status": "Success", "client": "SETTLD", "sort_code": PINCODES[pin][2], "remarks": [],
+            "packages": [{"status": "Success", "client": "SETTLD", "sort_code": _pin_info(pin)[2], "remarks": [],
                           "waybill": wb, "cod_amount": 0.0, "payment": s.get("payment_mode", "Pre-paid"),
                           "serviceable": True, "refnum": order}],
             "cash_pickups": 0.0, "cod_count": 0, "success": True, "prepaid_count": 1, "pickups": 0, "cod_amount": 0.0}
@@ -176,7 +195,7 @@ def dlv_create(data):
 def _scan(wb, status, stype, instr, loc=None):
     s = DLV["shipments"][wb]
     s["status"] = {"Status": status, "StatusType": stype, "StatusDateTime": ts(),
-                   "StatusLocation": loc or (PINCODES.get(s["pin"], ("Mumbai",))[0] + "_DC"), "Instructions": instr}
+                   "StatusLocation": loc or ((_pin_info(s["pin"]) or ("Mumbai",))[0] + "_DC"), "Instructions": instr}
     s["scans"].append({"ScanDetail": {"Scan": status, "ScanType": stype, "ScanDateTime": ts(),
                                       "ScannedLocation": s["status"]["StatusLocation"], "Instructions": instr}})
 
@@ -243,7 +262,7 @@ def dlv_track(waybill=None, ref_ids=None):
         elif st == 5:
             _deliver(s)
     return 200, {"ShipmentData": [{"Shipment": {
-        "AWB": s["waybill"], "ReferenceNo": s["order"], "Origin": "Thane", "Destination": PINCODES.get(s["pin"], ("?",))[0],
+        "AWB": s["waybill"], "ReferenceNo": s["order"], "Origin": "Thane", "Destination": (_pin_info(s["pin"]) or ("?",))[0],
         "Consignee": {"Name": s["name"], "PinCode": int(s["pin"])}, "Status": s["status"], "Scans": s["scans"],
         "PickUpDate": s["scans"][1]["ScanDetail"]["ScanDateTime"] if len(s["scans"]) > 1 else None,
         "DeliveryDate": s["status"]["StatusDateTime"] if s["status"]["Status"] == "Delivered" else None,
