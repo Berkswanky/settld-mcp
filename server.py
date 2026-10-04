@@ -320,7 +320,10 @@ def pincode_serviceability(filter_codes: str | int) -> dict:
     """GET /c/api/pin-codes/json/?filter_codes=<pin>. Empty delivery_codes = not serviceable. pickup='N' = no pickup."""
     filter_codes = str(filter_codes).strip()
     log("delhivery", f"GET /c/api/pin-codes/json/?filter_codes={filter_codes}")
-    return dlv_pincode(filter_codes)
+    body = dlv_pincode(filter_codes)
+    codes = body["delivery_codes"]
+    return {"http_status": 200, "body": body, "pin": filter_codes, "serviceable": bool(codes),
+            "pickup_available": bool(codes) and codes[0]["postal_code"]["pickup"] == "Y"}
 
 
 @delhivery.tool(annotations=READ)
@@ -346,7 +349,13 @@ def create_shipment(shipments: list[dict], pickup_location: dict) -> dict:
     may still have been created, so check GET /api/v1/packages/json/?ref_ids=<order> before retrying."""
     log("delhivery", f"POST /api/cmu/create.json order={shipments[0].get('order') if shipments else None}")
     code, body = dlv_create({"shipments": shipments, "pickup_location": pickup_location})
-    return {"http_status": code, "body": body}
+    out = {"http_status": code, "body": body}
+    if code == 504:
+        out["note"] = ("TIMEOUT: the result is UNKNOWN. This is NOT a serviceability answer. The shipment may already "
+                       "exist: call track_shipment with ref_ids=<order> before any retry.")
+    elif not body.get("success") and "Duplicate order id" in str(body):
+        out["note"] = "Shipment already exists for this order id: call track_shipment with ref_ids=<order> to get the waybill."
+    return out
 
 
 @delhivery.tool(annotations=WRITE)
@@ -356,7 +365,10 @@ def create_pickup_request(pickup_location: str, pickup_time: str, pickup_date: s
     log("delhivery", f"POST /fm/request/new/ {pickup_date} {pickup_time}")
     code, body = dlv_pickup({"pickup_location": pickup_location, "pickup_time": pickup_time,
                              "pickup_date": pickup_date, "expected_package_count": expected_package_count})
-    return {"http_status": code, "body": body}
+    out = {"http_status": code, "body": body}
+    if (body.get("error") or {}).get("code") == "NO_RIDER_AVAILABLE":
+        out["note"] = "No rider for this slot. Book body.error.next_available_slot (same pickup_location) and tell the renter the new time."
+    return out
 
 
 @delhivery.tool(annotations=READ)
@@ -521,7 +533,14 @@ def get_payment_link(payment_link_id: str) -> dict:
     PROCESSED (paid). Can return 504 GATEWAY_TIMEOUT: retry later with the same id."""
     log("pinelabs", f"GET /api/pay/v1/paymentlink/{payment_link_id}")
     code, body = pine_get_link(payment_link_id)
-    return {"http_status": code, "body": body}
+    out = {"http_status": code, "body": body}
+    if code == 504:
+        out["note"] = "TIMEOUT: payment status UNKNOWN. Do not create a new link; check again next run."
+    elif code == 200:
+        out["paid"] = body.get("status") == "PROCESSED"
+        if (body.get("last_attempt") or {}).get("status") == "FAILED" and not out["paid"]:
+            out["note"] = f"Last attempt FAILED ({body['last_attempt'].get('reason')}). The same link is still open."
+    return out
 
 
 @pinelabs.tool(annotations=READ)
@@ -583,6 +602,12 @@ def _tg_download(file_id):
         return r.read(), f["file_path"]
 
 
+def _keyboard(buttons):
+    """Reply keyboard: tapping a button sends it as a normal visible text message (no spinner)."""
+    return json.dumps({"keyboard": [[{"text": b} for b in buttons[:3]]], "one_time_keyboard": True,
+                       "resize_keyboard": True, "is_persistent": False})
+
+
 telegram = new_mcp("telegram-settld", "Real Telegram Bot API for the renter's chat with Settld: read new messages, "
                    "voice notes and button taps; send text, buttons and voice notes.")
 
@@ -624,12 +649,12 @@ def get_renter_updates() -> dict:
 @telegram.tool(annotations=WRITE)
 def send_renter_message(text: str, buttons: list[str] | None = None) -> dict:
     """Send a text message to the renter (Telegram sendMessage). Optional buttons (max 3), e.g.
-    ["Confirm", "Cheaper option", "Cancel"]; a tap comes back in get_renter_updates as type=button."""
+    ["Confirm", "Cheaper option", "Cancel"]; a tap arrives in get_renter_updates as a text message with that exact text."""
     if not TG["chat_id"]:
         return {"sent": False, "error": "Renter has not messaged the bot yet (send /start)."}
     params = {"chat_id": TG["chat_id"], "text": text[:4000]}
     if buttons:
-        params["reply_markup"] = json.dumps({"inline_keyboard": [[{"text": b, "callback_data": b[:60]} for b in buttons[:3]]]})
+        params["reply_markup"] = _keyboard(buttons)
     try:
         r = _tg_api("sendMessage", params)
         log("telegram", f"sendMessage -> {r['message_id']}")
@@ -650,7 +675,7 @@ def send_renter_voice(audio_id: str, caption: str = "", buttons: list[str] | Non
     try:
         params = {"chat_id": TG["chat_id"], "caption": caption[:1000]}
         if buttons:
-            params["reply_markup"] = json.dumps({"inline_keyboard": [[{"text": b, "callback_data": b[:60]} for b in buttons[:3]]]})
+            params["reply_markup"] = _keyboard(buttons)
         r = _tg_api("sendVoice", params,
                     files={"voice": ("settld.ogg", a, "audio/ogg")}, timeout=30)
         log("telegram", f"sendVoice -> {r['message_id']}")
@@ -839,6 +864,12 @@ def gnani_consent_extract(mission_id: str, transcript: str, question_asked: str,
     return rec
 
 
+def _calendar():
+    """Next 7 days: weekday -> date, so 'Saturday' maps to a real date."""
+    d0 = now().date()
+    return {(d0 + timedelta(days=i)).strftime("%A"): (d0 + timedelta(days=i)).isoformat() for i in range(1, 8)}
+
+
 @settld.tool(annotations=READ)
 def mission_get(mission_id: str = "") -> dict:
     """Read Settld's memory for a mission (state, facts, ids, timers). With no id, returns the active mission.
@@ -846,11 +877,12 @@ def mission_get(mission_id: str = "") -> dict:
     if not mission_id:
         act = [m for m in MEM["missions"].values() if m.get("state") not in ("CLOSED", "CANCELLED")]
         if not act:
-            return {"active": False, "now_ist": ts(), "message": "No active mission. Wait for a renter request."}
+            return {"active": False, "now_ist": ts(), "calendar_next_7_days": _calendar(),
+                    "message": "No active mission. Wait for a renter request."}
         m = sorted(act, key=lambda x: x["updated_at"])[-1]
-        return {"active": True, "now_ist": ts(), **m}
+        return {"active": True, "now_ist": ts(), "calendar_next_7_days": _calendar(), **m}
     m = MEM["missions"].get(mission_id)
-    return {"active": bool(m), "now_ist": ts(), **(m or {})}
+    return {"active": bool(m), "now_ist": ts(), "calendar_next_7_days": _calendar(), **(m or {})}
 
 
 @settld.tool(annotations=WRITE)
