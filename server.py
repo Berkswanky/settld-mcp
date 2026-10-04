@@ -953,12 +953,31 @@ async def r_checkout_pay(request):
 
 async def r_health(request):
     return JSONResponse({"service": "settld-v2", "at": ts(), "connectors": ["/gnani/mcp", "/telegram/mcp",
-                         "/delhivery/mcp", "/pinelabs/mcp", "/settld/mcp"], "sim": SIM,
+                         "/delhivery/mcp", "/pinelabs/mcp", "/settld/mcp", "/rails/mcp"], "sim": SIM,
                          "gnani_key": bool(os.environ.get("GNANI_API_KEY")),
                          "telegram_token": bool(os.environ.get("TELEGRAM_BOT_TOKEN"))})
 
 
-SERVERS = [gnani, telegram, delhivery, pinelabs, settld]
+# Combined connector: AgenticOrg's agent wizard validates tools from only one MCP connector per agent,
+# so all rails are also served from /rails/mcp with rail-prefixed tool names.
+rails = new_mcp("settld-rails", "All Settld rails in one connector. Prefix = rail: gnani_* (REAL Gnani STT/TTS), "
+                "telegram_* (REAL Telegram), delhivery_* (Delhivery API mock, exact endpoints), pinelabs_* (Pine Labs "
+                "Plural mock, exact endpoints), settld_* (3 new capabilities + mission memory).")
+_RAIL_TOOLS = [
+    ("gnani", gnani, ["speech_to_text", "text_to_speech"]),
+    ("telegram", telegram, ["get_renter_updates", "send_renter_message", "send_renter_voice"]),
+    ("delhivery", delhivery, ["pincode_serviceability", "calculate_shipping_cost", "fetch_waybill", "create_shipment",
+                              "create_pickup_request", "track_shipment", "ndr_update", "cancel_shipment"]),
+    ("pinelabs", pinelabs, ["generate_token", "create_payment_link", "get_payment_link", "get_order", "create_refund"]),
+    ("settld", settld, ["pine_mandate_evaluate", "pine_conditional_release", "gnani_consent_extract", "mission_get",
+                        "mission_save"]),
+]
+for _prefix, _srv, _names in _RAIL_TOOLS:
+    for _n in _names:
+        _t = _srv._tool_manager.get_tool(_n)
+        rails.add_tool(_t.fn, name=f"{_prefix}_{_n}", description=_t.description, annotations=_t.annotations)
+
+SERVERS = [gnani, telegram, delhivery, pinelabs, settld, rails]
 
 
 @contextlib.asynccontextmanager
@@ -989,7 +1008,7 @@ routes = [
 ]
 # MCP apps are mounted last so the REST routes above win on overlapping prefixes.
 for prefix, srv in (("/gnani", gnani), ("/telegram", telegram), ("/delhivery", delhivery),
-                    ("/pinelabs", pinelabs), ("/settld", settld)):
+                    ("/pinelabs", pinelabs), ("/settld", settld), ("/rails", rails)):
     routes.append(Mount(prefix, app=srv.streamable_http_app()))
 
 app = Starlette(routes=routes, lifespan=lifespan)
