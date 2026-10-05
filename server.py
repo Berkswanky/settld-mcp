@@ -603,9 +603,8 @@ def _tg_download(file_id):
 
 
 def _keyboard(buttons):
-    """Reply keyboard: tapping a button sends it as a normal visible text message (no spinner)."""
-    return json.dumps({"keyboard": [[{"text": b} for b in buttons[:3]]], "one_time_keyboard": True,
-                       "resize_keyboard": True, "is_persistent": False})
+    """Inline buttons under the message; a tap arrives in get_renter_updates as type=button with that text."""
+    return json.dumps({"inline_keyboard": [[{"text": b, "callback_data": b[:60]} for b in buttons[:3]]]})
 
 
 telegram = new_mcp("telegram-settld", "Real Telegram Bot API for the renter's chat with Settld: read new messages, "
@@ -649,7 +648,7 @@ def get_renter_updates() -> dict:
 @telegram.tool(annotations=WRITE)
 def send_renter_message(text: str, buttons: list[str] | None = None) -> dict:
     """Send a text message to the renter (Telegram sendMessage). Optional buttons (max 3), e.g.
-    ["Confirm", "Cheaper option", "Cancel"]; a tap arrives in get_renter_updates as a text message with that exact text."""
+    ["Confirm", "Cheaper option", "Cancel"]; a tap comes back in get_renter_updates as type=button."""
     if not TG["chat_id"]:
         return {"sent": False, "error": "Renter has not messaged the bot yet (send /start)."}
     params = {"chat_id": TG["chat_id"], "text": text[:4000]}
